@@ -1,0 +1,105 @@
+services:
+  postgresql:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgresql
+    ports:
+      - "7233:7233"
+
+  temporal-init:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until temporal operator cluster health 2>/dev/null | grep -q SERVING; do sleep 2; done
+        temporal operator namespace describe -n kai >/dev/null 2>&1 || temporal operator namespace create --retention 3d -n kai
+        i=0
+        until temporal operator namespace describe -n kai >/dev/null 2>&1 || [ $$i -gt 15 ]; do i=$$((i+1)); sleep 2; done
+        for name in TenantId WorkflowKey Origin StepId ConversationId; do
+          temporal operator search-attribute create -n kai --name $$name --type Keyword || true
+        done
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_DEFAULT_NAMESPACE: kai
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8081:8080"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://kai:kai@postgresql:5432/kai
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: kai
+      REDIS_URL: redis://redis:6379/0
+      GEMINI_API_KEY: ""
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      temporal-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+
+  worker:
+    build: .
+    command: python -m kai.worker
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://kai:kai@postgresql:5432/kai
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: kai
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      temporal-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+
+volumes:
+  pgdata:

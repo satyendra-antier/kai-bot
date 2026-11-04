@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Kai</title>
+  <style>
+    :root { color-scheme: light; --ink: #1c1915; --muted: #6b645c; --line: #e4ddd4; --paper: #f6f3ee; --accent: #0f6e56; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.45 "Iowan Old Style", Palatino, Georgia, serif; color: var(--ink); background: var(--paper); }
+    main { max-width: 720px; margin: 0 auto; min-height: 100vh; display: flex; flex-direction: column; background: white; }
+    section { display: flex; flex-direction: column; min-height: 100vh; }
+    header { padding: 18px 22px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: baseline; }
+    header strong { font-size: 18px; }
+    header span { color: var(--muted); font-size: 13px; }
+    #log { flex: 1; overflow: auto; padding: 22px; display: flex; flex-direction: column; gap: 12px; }
+    .bubble { max-width: 38rem; padding: 10px 12px; border: 1px solid var(--line); background: white; }
+    .bubble.user { align-self: flex-end; background: #e7f3ef; }
+    .prompt-card { display: flex; flex-wrap: wrap; gap: 8px; }
+    .prompt-card button { background: white; color: var(--ink); border: 1px solid var(--line); padding: 8px 12px; cursor: pointer; }
+    .prompt-card form { display: flex; flex-direction: column; gap: 8px; width: 100%; border: 0; padding: 0; }
+    .who { display: block; font: 11px/1.2 ui-sans-serif, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+    form { display: flex; gap: 8px; padding: 14px; border-top: 1px solid var(--line); }
+    input { flex: 1; font: inherit; padding: 10px 12px; border: 1px solid var(--line); background: white; }
+    button { font: 14px/1 ui-sans-serif, sans-serif; background: var(--accent); color: white; border: 0; padding: 0 16px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <header><strong id="title">Kai</strong><span id="status">Online</span><button type="button" id="fresh">New chat</button></header>
+      <div id="log"></div>
+      <form id="form">
+        <input id="text" autocomplete="off" placeholder="Top up my USD with €100 from EUR" />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+  <script>
+    const key = "demo-key";
+    const params = new URLSearchParams(location.search);
+    const pinned = params.get("workflow") || "";
+    const storageKey = "kai-conv-" + (pinned || "demo");
+    let id = sessionStorage.getItem(storageKey) || (pinned ? "" : "demo");
+    if (!id) {
+      id = "c-" + Date.now();
+      sessionStorage.setItem(storageKey, id);
+    }
+    const log = document.querySelector("#log");
+    if (pinned) {
+      fetch("/v1/workflows/" + pinned, { headers: { "X-Api-Key": key } })
+        .then((res) => res.ok ? res.json() : null)
+        .then((row) => { if (row) document.querySelector("#title").textContent = row.name; });
+    }
+    document.querySelector("#fresh").addEventListener("click", () => {
+      id = "c-" + Date.now();
+      sessionStorage.setItem(storageKey, id);
+      log.replaceChildren();
+      document.querySelector("#status").textContent = "Online";
+    });
+    function bubble(role, text) {
+      const el = document.createElement("div");
+      el.className = "bubble " + role;
+      el.innerHTML = "<span class='who'>" + (role === "user" ? "You" : "Kai") + "</span>" + text;
+      return el;
+    }
+    async function post(text) {
+      await fetch("/v1/conversations/" + id + "/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Api-Key": key },
+        body: JSON.stringify({ text, workflow_id: pinned || null }),
+      });
+      refresh();
+    }
+    function promptCard(prompt) {
+      const card = document.createElement("div");
+      card.className = "prompt-card";
+      (prompt.choices || []).forEach((choice) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = choice.label || choice.port;
+        button.addEventListener("click", () => post(choice.label || choice.port));
+        card.append(button);
+      });
+      return card;
+    }
+    async function refresh() {
+      const res = await fetch("/v1/conversations/" + id, { headers: { "X-Api-Key": key } });
+      if (!res.ok) return;
+      const data = await res.json();
+      const known = new Set((data.messages || []).filter((row) => row.role === "kai").map((row) => row.text));
+      const spoken = ((data.run && data.run.messages) || []).filter((row) => row.text && !known.has(row.text)).map((row) => bubble("kai", row.text));
+      const nodes = [...data.messages.map((row) => bubble(row.role, row.text)), ...spoken];
+      const prompt = data.run && data.run.prompt;
+      const fields = (prompt && prompt.fields) || [];
+      const choices = (prompt && prompt.choices) || [];
+      if (prompt && (choices.length || fields.length)) nodes.push(promptCard(prompt));
+      log.replaceChildren(...nodes);
+      const box = document.querySelector("#text");
+      const answering = fields.length && !choices.length;
+      box.placeholder = answering ? "Your answer" : "Top up my USD with €100 from EUR";
+      box.type = answering && fields.some((field) => field.type === "password") ? "password" : "text";
+      document.querySelector("#status").textContent = "Online";
+    }
+    document.querySelector("#form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const input = document.querySelector("#text");
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = "";
+      await post(text);
+    });
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from kai.config import GEMINI_API_KEY, GEMINI_MODEL
+from kai.config import GEMINI_API_KEY, GEMINI_MODEL, apply_langsmith_env, langsmith_enabled
 
 
 def enabled() -> bool:
@@ -19,6 +19,18 @@ def _client():
 
 
 def _json(prompt: str) -> dict[str, Any] | None:
+    apply_langsmith_env()
+    if langsmith_enabled():
+        try:
+            from langsmith import traceable
+
+            return traceable(name="kai.gemini.json", run_type="llm")(_json_body)(prompt)
+        except Exception:
+            pass
+    return _json_body(prompt)
+
+
+def _json_body(prompt: str) -> dict[str, Any] | None:
     if not enabled():
         return None
     try:
@@ -63,14 +75,14 @@ def extract(text: str, slots: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 def interpret(text: str, catalog: list[dict[str, Any]], state: dict[str, Any]) -> dict[str, Any] | None:
     parsed = _json(
-        "You route one customer message for Kai. The published workflows decide what is possible. "
+        "You route one customer message for Kai. The loaded chat workflows decide what is possible. "
         "Choose from those workflows and from what the customer just said. "
-        "Return JSON with action (start, fill, answer, or chat), workflow_key (a published key, or empty), "
+        "Return JSON with action (start, fill, answer, or chat), workflow_key (a loaded key, or empty), "
         "confidence (0 to 1), slots (only values the message itself states; amount is a number or string), "
         "needs (accounts, cards, or none), and reply (one or two sentences). "
         "start begins a workflow. fill answers the slot that workflow is waiting for. "
         "When state.waiting is set, the customer is on an open question. "
-        "If they clearly want a different published workflow, return start for that workflow. "
+        "If they clearly want a different loaded workflow, return start for that workflow. "
         "If they are answering the open question, do not invent a port; the buttons handle that. "
         "answer is for a question, including asking what is available or to list a card or account; "
         "set needs to accounts or cards when they want balances, and do not put those words into slots. "

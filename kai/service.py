@@ -28,20 +28,22 @@ def story_failures(graph: dict, suite: list[dict]) -> list[str]:
     return failed
 
 
-def try_utterance(draft: dict, text: str) -> dict[str, Any]:
+def try_utterance(draft: dict, text: str, workflow_key: str = "") -> dict[str, Any]:
     contract = draft.get("chat_contract") or {}
     graph = draft.get("graph") or {}
-    score = score_intent(text, contract)
+    score = score_intent(text, contract, workflow_key=workflow_key)
     band = decide_band(score, contract.get("bands") or {})
     extracted = extract_slots(text)
     slots = {key: item["value"] for key, item in extracted.items()}
     slot_from = {key: item["from"] for key, item in extracted.items()}
     if band == "not_this":
-        return {"band": band, "confidence": score, "slots": slot_from, "messages": [], "trace": [], "status": "idle"}
+        idle = str(contract.get("idle") or "").strip()
+        messages = [{"step_id": "idle", "text": idle}] if idle else []
+        return {"band": band, "confidence": score, "slots": slot_from, "messages": messages, "trace": [], "status": "idle"}
     if band == "ask":
         entry = ((graph.get("entries") or {}).get("chat")) or "chat_request"
-        line = (contract.get("lines") or {}).get(entry) or contract.get("setup") or ""
-        return {"band": band, "confidence": score, "slots": slot_from, "messages": [{"step_id": entry, "text": line}], "trace": [], "status": "ask"}
+        line = str(contract.get("setup") or "").strip() or (contract.get("lines") or {}).get(entry) or "Is that what you want me to do?"
+        return {"band": band, "confidence": score, "slots": slot_from, "messages": [{"step_id": "setup", "text": line}], "trace": [], "status": "ask"}
     missing = missing_slot(contract.get("slots") or [], slots)
     if missing:
         return {

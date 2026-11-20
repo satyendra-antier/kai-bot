@@ -38,11 +38,18 @@ def test_open_prompt_answers_other_words_in_the_thread():
     def understand(payload):
         return {"action": "chat", "reply": "Still waiting.", "slots": {}, "needs": "none", "workflow_key": "", "confidence": 0}
 
-    other = run_conversation({"text": "what does this do?", "phase": "in_run", "prompt": prompt}, understand)
+    called = {"n": 0}
+
+    def understand_counted(payload):
+        called["n"] += 1
+        return understand(payload)
+
+    other = run_conversation({"text": "what does this do?", "phase": "in_run", "prompt": prompt}, understand_counted)
     assert other["action"] == "answer"
     assert other["port"] == ""
     assert other["reply"] == "Top up USD."
     assert other["route"] == "aside"
+    assert called["n"] == 0  # mistypes re-ask without Gemini
     chosen = run_conversation({"text": "Yes", "phase": "in_run", "prompt": prompt}, understand)
     assert chosen["action"] == "choice"
     assert chosen["port"] == "yes"

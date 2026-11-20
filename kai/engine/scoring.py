@@ -179,11 +179,15 @@ def _values_survived(expected: str, actual: str) -> bool:
 
 
 def _guardrails(run: dict[str, Any], contract: dict[str, Any], graph: dict[str, Any] | None = None) -> float:
+    from kai.engine.never import breach_never
+
     rules = contract.get("never") or []
     if not rules:
         return 100.0
     events = run.get("events") or []
     transcript = " ".join(message.get("text", "") for message in run.get("messages") or [])
+    if breach_never(transcript, rules):
+        return 0.0
     for rule in rules:
         if rule.get("mode") == "order":
             steps = {step["id"]: step for step in (graph or {}).get("steps") or []}
@@ -200,12 +204,8 @@ def _guardrails(run: dict[str, Any], contract: dict[str, Any], graph: dict[str, 
             message_before = any(message.get("text") for message in run.get("messages") or [])
             if approval_at is not None and not message_before:
                 return 0.0
-        else:
-            for phrase in rule.get("forbidden") or []:
-                if phrase.lower() in transcript.lower():
-                    return 0.0
-            if rule.get("judge_breach"):
-                return 0.0
+        elif rule.get("judge_breach"):
+            return 0.0
     return 100.0
 
 

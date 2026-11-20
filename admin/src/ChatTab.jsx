@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 function tokens(text) {
   return [...String(text || "").matchAll(/\{(\w+)\}/g)].map((match) => match[1]);
@@ -14,13 +14,73 @@ function previewBalances(ledger) {
   return parts.length ? parts.join(" · ") : "none on this draft yet";
 }
 
+function chipLabel(item) {
+  return typeof item === "string" ? item : (item.text || item.key || item.name || "");
+}
+
 function Chips({ items, onRemove, onAdd, addLabel, placeholder }) {
+  const [draft, setDraft] = useState("");
+  const [open, setOpen] = useState(false);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (open && inputRef.current) inputRef.current.focus();
+  }, [open]);
+
+  function commit() {
+    const value = draft.trim();
+    if (!value) return;
+    onAdd(value);
+    setDraft("");
+    setOpen(false);
+  }
+
   return (
-    <div className="chips">
-      {(items || []).map((item, index) => (
-        <span key={index} className="chip">{typeof item === "string" ? item : (item.text || item.key || item.name || "")}<button type="button" onClick={() => onRemove(index)}>×</button></span>
-      ))}
-      <button type="button" className="link" onClick={() => onAdd(window.prompt(placeholder || addLabel) || "")}>{addLabel}</button>
+    <div className="chip-field">
+      <div className="chips">
+        {(items || []).map((item, index) => (
+          <span key={`${chipLabel(item)}-${index}`} className="chip">
+            <span>{chipLabel(item)}</span>
+            <button type="button" aria-label={`Remove ${chipLabel(item)}`} onClick={() => onRemove(index)}>×</button>
+          </span>
+        ))}
+        {!open ? (
+          <button type="button" className="chip-add" onClick={() => setOpen(true)}>{addLabel}</button>
+        ) : null}
+      </div>
+      {open ? (
+        <form
+          className="chip-compose"
+          onSubmit={(event) => {
+            event.preventDefault();
+            commit();
+          }}
+        >
+          <input
+            ref={inputRef}
+            value={draft}
+            placeholder={placeholder || "Type and press Enter"}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                setDraft("");
+                setOpen(false);
+              }
+            }}
+          />
+          <button type="submit" disabled={!draft.trim()}>Add</button>
+          <button
+            type="button"
+            className="chip-cancel"
+            onClick={() => {
+              setDraft("");
+              setOpen(false);
+            }}
+          >
+            Cancel
+          </button>
+        </form>
+      ) : null}
     </div>
   );
 }
@@ -40,17 +100,33 @@ export default function ChatTab({ contract, graph, onChange, onSave, onTry, tryR
     <div className="chat-layout">
     <div className="panel chat-tab">
       <label>Setup</label>
+      <p className="hint">Said to the customer on the ask band — Kai thinks this might be the request but is not sure enough to start. Prefer a short yes/no. This field wins over the chat-entry line for that ask.</p>
       <textarea value={contract.setup || ""} onChange={(event) => onChange({ ...contract, setup: event.target.value })} />
       <label>When nothing matches</label>
+      <p className="hint">Said when the score is below “Not this”, the phrase is an exclusion, or Kai has no workflow to start. Also used after a plain greeting. Try-it shows this line for exclusion chips.</p>
       <textarea value={contract.idle || ""} onChange={(event) => onChange({ ...contract, idle: event.target.value })} />
       <h2>When is it this request</h2>
       <label>Description the classifier reads</label>
       <p className="hint">Written for the model, not the customer. Say what the customer wants, not which words they use.</p>
       <textarea value={contract.description || ""} onChange={(event) => onChange({ ...contract, description: event.target.value })} />
       <label>Examples</label>
-      <Chips items={contract.examples || []} addLabel="+ example" onAdd={(value) => value && onChange({ ...contract, examples: [...(contract.examples || []), value] })} onRemove={(index) => onChange({ ...contract, examples: (contract.examples || []).filter((_, item) => item !== index) })} />
+      <p className="hint">Phrases that should start this workflow. Keep them short and specific.</p>
+      <Chips
+        items={contract.examples || []}
+        addLabel="+ example"
+        placeholder="e.g. Tell me when EUR goes under 50"
+        onAdd={(value) => value && onChange({ ...contract, examples: [...(contract.examples || []), value] })}
+        onRemove={(index) => onChange({ ...contract, examples: (contract.examples || []).filter((_, item) => item !== index) })}
+      />
       <label>Not this — send it elsewhere</label>
-      <Chips items={contract.exclusions || []} addLabel="+ exclusion" onAdd={(value) => value && onChange({ ...contract, exclusions: [...(contract.exclusions || []), value] })} onRemove={(index) => onChange({ ...contract, exclusions: (contract.exclusions || []).filter((_, item) => item !== index) })} />
+      <p className="hint">Phrases that look similar but belong to another workflow.</p>
+      <Chips
+        items={contract.exclusions || []}
+        addLabel="+ exclusion"
+        placeholder="e.g. Top up my USD"
+        onAdd={(value) => value && onChange({ ...contract, exclusions: [...(contract.exclusions || []), value] })}
+        onRemove={(index) => onChange({ ...contract, exclusions: (contract.exclusions || []).filter((_, item) => item !== index) })}
+      />
       <h2>How sure Kai must be</h2>
       <div className="bands">
         <label>Start at or above<input value={contract.bands?.start_at ?? 0.75} onChange={(event) => onChange({ ...contract, bands: { ...contract.bands, start_at: Number(event.target.value) } })} /></label>
@@ -105,27 +181,39 @@ export default function ChatTab({ contract, graph, onChange, onSave, onTry, tryR
         if (quiet) setLines({ ...lines, [quiet.id]: "" });
       }}>+ line</button>
       <h2>Kai never</h2>
+      <p className="hint">Guardrails for this workflow. Judged rules flag the run and block the phrase live if Kai tries to say it. Order rules are checked against the step timeline when the run is scored.</p>
       <Chips
         items={(contract.never || []).map((rule) => rule.text || rule.id)}
         addLabel="+ rule"
-        onAdd={(value) => value && onChange({ ...contract, never: [...(contract.never || []), { id: `rule-${(contract.never || []).length + 1}`, mode: "judged", text: value, forbidden: [] }] })}
+        placeholder="Something Kai must never say or invent"
+        onAdd={(value) => value && onChange({ ...contract, never: [...(contract.never || []), { id: `rule-${(contract.never || []).length + 1}`, mode: "judged", text: value, forbidden: [value] }] })}
         onRemove={(index) => onChange({ ...contract, never: (contract.never || []).filter((_, item) => item !== index) })}
       />
       <div className="row"><button type="button" onClick={onSave}>Save chat contract</button></div>
+      <p className="hint">Save updates the draft immediately — live chat loads the draft, so classifier examples, slots, Setup, idle, and Kai never take effect without publishing. Publish still snapshots a version for rules and eval history.</p>
     </div>
     <aside className="try-rail">
       <h2>Try it</h2>
-      <form onSubmit={(event) => { event.preventDefault(); if (draft.trim()) onTry(draft.trim()); }}>
-        <textarea value={draft} placeholder="Tell me when EUR to USD goes above 1.10" onChange={(event) => setDraft(event.target.value)} />
-        <button type="submit">Run</button>
+      <form onSubmit={(event) => { event.preventDefault(); if (draft.trim() && !tryResult?.loading) onTry(draft.trim()); }}>
+        <textarea value={draft} placeholder="Tell me when EUR to USD goes above 1.10" onChange={(event) => setDraft(event.target.value)} disabled={!!tryResult?.loading} />
+        <button type="submit" disabled={!draft.trim() || !!tryResult?.loading}>{tryResult?.loading ? "Running…" : "Run"}</button>
       </form>
       <div className="prompts">
         {(contract.try_prompts || contract.examples || []).map((prompt, index) => (
-          <button key={typeof prompt === "string" ? prompt : index} type="button" onClick={() => { const text = typeof prompt === "string" ? prompt : (prompt.text || ""); setDraft(text); onTry(text); }}>{typeof prompt === "string" ? prompt : (prompt.text || "")}</button>
+          <button key={typeof prompt === "string" ? prompt : index} type="button" disabled={!!tryResult?.loading} onClick={() => { const text = typeof prompt === "string" ? prompt : (prompt.text || ""); setDraft(text); onTry(text); }}>{typeof prompt === "string" ? prompt : (prompt.text || "")}</button>
         ))}
       </div>
       <p className="hint">Balances in this preview: {previewBalances(contract.preview_ledger)}</p>
-      {tryResult ? (
+      {tryResult?.loading ? (
+        <div className="run-note try-loading" aria-live="polite" aria-busy="true">
+          <span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>
+          <span>Scoring “{tryResult.text}”…</span>
+        </div>
+      ) : null}
+      {tryResult?.error ? (
+        <div className="run-note try-error">{tryResult.error}</div>
+      ) : null}
+      {tryResult && !tryResult.loading && !tryResult.error ? (
         <div className="run-note">
           <p>{tryResult.band} · {tryResult.confidence}</p>
           <p>{(tryResult.trace || []).join(" → ")}</p>

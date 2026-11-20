@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, TypedDict
 
 from kai.engine.objections import is_objection, next_objection_strike, objection_port
 from kai.engine.prompts import match_choice
-from kai.engine.slots import greeting_reply, looks_like_question
+from kai.engine.slots import asks_capacity, asks_for_accounts, greeting_reply, looks_like_question
 from kai.engine.tools import select_tool
 
 
@@ -158,12 +159,19 @@ def run_conversation(payload: dict[str, Any], understand: Callable[[dict[str, An
     graph.add_conditional_edges("start", route, targets)
     for node in ("choice", "fields", "object", "aside", "skip", "greet", "understand"):
         graph.add_edge(node, END)
+    from kai.config import apply_langsmith_env, langsmith_enabled
+
+    apply_langsmith_env()
+    invoke_config: dict[str, Any] = {"run_name": "kai_conversation_turn"}
+    if langsmith_enabled():
+        invoke_config["tags"] = ["kai", "conversation"]
     result = graph.compile().invoke(
         {
             "text": payload.get("text") or "",
             "phase": payload.get("phase") or "idle",
             "prompt": prompt,
-        }
+        },
+        config=invoke_config,
     )
     return result.get("decision") or understand(payload)
 
@@ -173,24 +181,36 @@ def _is_skip(text: str) -> bool:
 
 
 def _with_route(decision: dict[str, Any], route: str) -> dict[str, Any]:
+    from kai.engine.audit import step, turn_trail
+
     decision = dict(decision)
     decision["route"] = route
-    steps = list(decision.get("ai_steps") or [])
-    detail = route
-    if decision.get("strike"):
-        detail = f"{route} · strike {decision['strike']} of 3"
-    if decision.get("action") == "answer" and route in {"aside", "object"} and not decision.get("port"):
-        detail = f"{detail} · reask" if "reask" not in detail else detail
-    steps.append({"id": "route", "label": "Route", "detail": detail})
-    if decision.get("action") == "choice" and decision.get("port"):
-        steps.append({"id": "decision", "label": "Decision", "detail": f"choice port={decision['port']}"})
-    elif decision.get("action") == "start" and decision.get("workflow_key"):
-        steps.append({"id": "decision", "label": "Decision", "detail": f"start {decision['workflow_key']}"})
-    elif decision.get("action") == "answer":
-        steps.append({"id": "decision", "label": "Decision", "detail": "reask" if route in {"aside", "object"} else "answer"})
-    elif decision.get("action") == "chat":
-        steps.append({"id": "decision", "label": "Decision", "detail": "chat"})
-    decision["ai_steps"] = steps
+    if decision.get("ai_steps"):
+        steps = list(decision.get("ai_steps") or [])
+        detail = route
+        if decision.get("strike"):
+            detail = f"{route} · strike {decision['strike']} of 3"
+        if decision.get("action") == "answer" and route in {"aside", "object"} and not decision.get("port"):
+            detail = f"{detail} · reask" if "reask" not in detail else detail
+        steps = [row for row in steps if row.get("id") not in {"route", "decision"}]
+        steps.append(step("route", "Route", detail, route=route, strike=decision.get("strike") or 0))
+        steps.append(
+            step(
+                "decision",
+                "Decision",
+                f"{decision.get('action')} {decision.get('port') or decision.get('workflow_key') or ''}".strip(),
+                action=decision.get("action"),
+                port=decision.get("port"),
+                workflow_key=decision.get("workflow_key"),
+            )
+        )
+        decision["ai_steps"] = steps
+        return decision
+    decision["ai_steps"] = turn_trail(
+        chosen=decision,
+        route=route,
+        strike=decision.get("strike"),
+    )
     return decision
 
 
@@ -252,21 +272,56 @@ def _without_graph(payload: dict[str, Any], understand: Callable[[dict[str, Any]
     return _with_route(understand(payload), "understand")
 
 
+def _looks_like_workflow_switch(text: str) -> bool:
+    """True when an open-prompt aside might be starting a different workflow."""
+    lowered = " ".join((text or "").lower().split())
+    if not lowered:
+        return False
+    if select_tool(text):
+        return True
+    return bool(
+        re.search(
+            r"\b(onboarding|open an account|new account|create an account|sign\s*up|sign\s*in|"
+            r"top\s*up|topup|transfer|sweep|move money|balance alert|fx rate|demo \w+|"
+            r"check balance|fetch balance|my balance|low balance)\b",
+            lowered,
+        )
+    )
+
+
 def _aside_decision(
     payload: dict[str, Any],
     prompt: dict[str, Any],
     understand: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
-    decision = understand(payload)
-    if (
-        decision.get("action") == "start"
-        and decision.get("workflow_key")
-        and decision.get("workflow_key") != (payload.get("workflow_key") or "")
-        and float(decision.get("confidence") or 0) >= 0.75
-    ):
-        decision.setdefault("port", "")
-        return decision
-    decision["action"] = "answer"
-    decision["port"] = ""
-    decision["reply"] = prompt.get("text") or decision.get("reply") or ""
-    return decision
+    # Default: re-ask instantly. Calling Gemini on every mistype made choice steps feel stuck.
+    text = payload.get("text") or ""
+    if _looks_like_workflow_switch(text):
+        decision = understand(payload)
+        if (
+            decision.get("action") == "start"
+            and decision.get("workflow_key")
+            and decision.get("workflow_key") != (payload.get("workflow_key") or "")
+            and float(decision.get("confidence") or 0) >= 0.75
+        ):
+            decision.setdefault("port", "")
+            return decision
+    # Mid-flow capacity / account questions get a real answer; mistypes just re-ask the prompt.
+    if asks_for_accounts(text) or asks_capacity(text):
+        decision = understand(payload)
+        if decision.get("action") in {"answer", "chat"}:
+            decision = dict(decision)
+            decision.setdefault("port", "")
+            prompt_line = str(prompt.get("text") or "").strip()
+            if prompt_line and prompt_line not in str(decision.get("reply") or ""):
+                decision["reask"] = prompt_line
+            return decision
+    return {
+        "action": "answer",
+        "port": "",
+        "workflow_key": "",
+        "confidence": 1,
+        "slots": {},
+        "needs": "none",
+        "reply": prompt.get("text") or "",
+    }

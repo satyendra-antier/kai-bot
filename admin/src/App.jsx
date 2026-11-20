@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { applyNodeChanges, Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow, useUpdateNodeInternals, ViewportPortal } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import AddStep from "./AddStep";
 import ChatTab from "./ChatTab";
-import CornerBot from "./CornerBot";
 import EvalTab from "./EvalTab";
 import Intelligence from "./Intelligence";
 import Settings from "./Settings";
@@ -11,8 +10,8 @@ import StepInspector from "./StepInspector";
 import { bindStep, lanesFor, placeStep } from "./lanes";
 
 const KEY = "demo-key";
-const GROUP_ORDER = ["", "move", "fiat", "cards", "onboarding"];
-const GROUP_LABEL = { "": "All", move: "Move", fiat: "Fiat", cards: "Cards", onboarding: "Onboarding" };
+const GROUP_ORDER = ["", "move", "fiat", "cards", "onboarding", "demo"];
+const GROUP_LABEL = { "": "All", move: "Move", fiat: "Fiat", cards: "Cards", onboarding: "Onboarding", demo: "Demo" };
 
 const KIND_LABEL = {
   source: "Source",
@@ -292,8 +291,14 @@ export default function App() {
   }
 
   async function runTry(text) {
-    setTryResult(await api("/v1/workflows/" + current.id + "/try", { method: "POST", body: JSON.stringify({ text }) }));
-    setTrace([]);
+    setTryResult({ loading: true, text });
+    try {
+      const result = await api("/v1/workflows/" + current.id + "/try", { method: "POST", body: JSON.stringify({ text }) });
+      setTryResult(result);
+      setTrace([]);
+    } catch (err) {
+      setTryResult({ error: err.message || "Try failed", text });
+    }
   }
 
   async function createWorkflow(event) {
@@ -313,9 +318,14 @@ export default function App() {
   }
 
   async function removeWorkflow() {
-    await api("/v1/workflows/" + current.id, { method: "DELETE" });
-    setCurrent(null);
-    setList(await api("/v1/workflows"));
+    if (!window.confirm(`Delete “${current.name}”? This cannot be undone.`)) return;
+    try {
+      await api("/v1/workflows/" + current.id, { method: "DELETE" });
+      setCurrent(null);
+      setList(await api("/v1/workflows"));
+    } catch (err) {
+      window.alert(err.message || "Could not delete this workflow.");
+    }
   }
 
   async function runWorkflow() {
@@ -414,16 +424,6 @@ export default function App() {
   const hasChat = (current?.channels || []).includes("chat");
   const selected = (graph?.steps || []).find((step) => step.id === selectedId);
   const stepType = (catalog.types || []).find((item) => item.type === selected?.type);
-  const showLiveTrace = useCallback((workflowId, next) => {
-    if (workflowId !== current?.id) return;
-    const path = next || [];
-    setTrace((currentTrace) => {
-      const same = currentTrace.length === path.length && currentTrace.every((step, index) => step === path[index]);
-      return same ? currentTrace : path;
-    });
-    setStoryNote(null);
-  }, [current?.id]);
-
   return (
     <div className="app">
       <div className="product">
@@ -440,11 +440,13 @@ export default function App() {
         <button className="item" onClick={() => setCreating((open) => !open)}>+ Add workflow</button>
         {creating ? (
           <form className="new-workflow" onSubmit={createWorkflow}>
-            <input value={newName} placeholder="Name" onChange={(event) => setNewName(event.target.value)} />
+            <input value={newName} placeholder="Name" onChange={(event) => setNewName(event.target.value)} required />
+            <label className="field-label">Start from</label>
             <select value={templateId} onChange={(event) => setTemplateId(event.target.value)}>
-              <option value="">Four-lane template</option>
-              {list.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              <option value="">Four-lane stub (empty Source → … → Done)</option>
+              {list.map((item) => <option key={item.id} value={item.id}>Copy “{item.name}” draft</option>)}
             </select>
+            <p className="form-hint">Copies a whole workflow draft (graph + chat contract). Canvas nodes still come from Step types when you Add step.</p>
             <button type="submit">Create</button>
           </form>
         ) : null}
@@ -463,20 +465,24 @@ export default function App() {
         <div className="group">Settings</div>
         <button className={settings ? "item active" : "item"} onClick={() => { setSettings(true); setCurrent(null); }}>
           Step types
-          <small>{(catalog.types || []).length} types · {(catalog.kinds || []).length || 9} kinds</small>
+          <small>
+            {(catalog.types || []).length} types · {(catalog.sync?.typed_steps ?? "—")} on canvases
+            {(catalog.sync?.missing_type_steps > 0) ? " · fix broken" : ""}
+          </small>
         </button>
       </nav>
       <main>
-        {settings ? <Settings catalog={catalog} onOpen={(id) => open(id)} /> : !current ? <div className="panel">Choose a workflow. The chat page at /chat runs the published version.</div> : (
+        {settings ? <Settings catalog={catalog} onOpen={(id) => open(id)} /> : !current ? <div className="panel">Choose a workflow. Live chat at /chat follows the saved draft. Publish snapshots a version for rules and eval history.</div> : (
           <>
             <header className="workflow-head">
               <p className="crumb">User intelligence / Workflows / {current.name}</p>
               <h1>{current.name}</h1>
               <p className="summary">{current.summary}</p>
               <p className="hint">{current.steps} steps · {current.built_from ? "built from the template" : `${current.stories} stories`}</p>
-              {current.draft_ahead ? <p className="hint">Chat follows this draft, including the question you just edited. Start a New chat after you edit.</p> : null}
+              <p className="hint">Open chat follows this draft (Guest or Logged in). Start a New chat there after you edit.</p>
+              {current.draft_ahead ? <p className="hint">Draft is ahead of the last published version used by rules.</p> : null}
               <div className="head-actions">
-                {hasChat ? <a href={`/chat?workflow=${current.id}`}>Open chat</a> : null}
+                {hasChat ? <a href={`/chat?workflow=${current.id}`} target="_blank" rel="noreferrer">Open chat</a> : null}
                 {current.built_from ? <button type="button" className="danger" onClick={removeWorkflow}>Delete workflow</button> : null}
               </div>
             </header>
@@ -484,7 +490,7 @@ export default function App() {
               <button className={tab === "workflow" ? "on" : ""} onClick={() => setTab("workflow")}>Workflow</button>
               {hasChat ? <button className={tab === "chat" ? "on" : ""} onClick={() => setTab("chat")}>Chat</button> : null}
               <button className={tab === "eval" ? "on" : ""} onClick={loadEval}>Eval</button>
-              <button onClick={publish}>Publish</button>
+              <button onClick={publish} title="Snapshot this draft for rules and eval history">Publish version</button>
             </div>
             {tab === "workflow" && (
               <div className="canvas">
@@ -495,7 +501,7 @@ export default function App() {
                     <button onClick={runWorkflow}>Run</button>
                   </div>
                   {runNote ? <div className="run-note">{runNote}</div> : null}
-                  {tryResult?.messages?.length ? (
+                  {tryResult?.messages?.length && !tryResult.loading && !tryResult.error ? (
                     <div className="run-note">{tryResult.messages.map((message) => message.text).filter(Boolean).join(" ")}</div>
                   ) : null}
                   <div className="flow">
@@ -549,7 +555,8 @@ export default function App() {
                 ) : !(graph?.steps || []).length ? (
                   <aside className="rail">
                     <h2>Build it on the canvas</h2>
-                    <p>Use Add step. Start in the Source lane with a chat request or a rule. The next template lands after that step, with its input and output.</p>
+                    <p>Use <b>Add step</b> to place a node from the shared step-type registry (Settings → Step types). Start in Source with Chat request or Rule, then fetch / ask / approval / action / result.</p>
+                    <p className="hint">“+ Add workflow” templates copy a whole draft. Step types are the per-node building blocks.</p>
                   </aside>
                 ) : (
                   <aside className="rail">
@@ -586,10 +593,6 @@ export default function App() {
       </main>
       </div>
       )}
-        <CornerBot
-        workflow={current}
-        onTrace={showLiveTrace}
-      />
     </div>
   );
 }

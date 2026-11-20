@@ -33,8 +33,12 @@ def redact_pii(text: str) -> tuple[str, list[str]]:
 
 def select_tool(text: str) -> str | None:
     """Pick the read tool this message is asking for, if it is a question rather than an answer."""
+    from kai.engine.slots import wants_alert
+
     lowered = " ".join((text or "").lower().split())
     if not lowered:
+        return None
+    if wants_alert(lowered):
         return None
     if _OPT_OUT.search(lowered):
         return "opt_out"

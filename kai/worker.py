@@ -8,14 +8,18 @@ from temporalio.worker import Worker
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
 
 from kai import activities
-from kai.config import REDIS_URL, TASK_QUEUE, TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE
+from kai.config import REDIS_URL, TASK_QUEUE, TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, apply_langsmith_env
 from kai.workflows import ConversationWorkflow, RunWorkflow
+
+apply_langsmith_env()
 
 ACTIVITY_FNS = [
     activities.load_contracts,
     activities.interpret_turn,
     activities.waiting_prompt,
+    activities.booked_ledger_activity,
     activities.append_message,
+    activities.record_event,
     activities.fetch_step,
     activities.act_step,
     activities.persist_run,

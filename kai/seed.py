@@ -1,4 +1,4 @@
-"""Load the demo tenant, the top-up workflow, and the rest of the catalog."""
+"""Load the demo tenant, the catalog, and the six live-demo workflows."""
 
 import time
 
@@ -8,6 +8,7 @@ from sqlalchemy import text
 
 from kai.db import session_scope
 from kai.engine.catalog import bundles
+from kai.engine.demos import bundles as demo_bundles
 from kai.engine.registry import STEP_TYPES
 from kai.intelligence import CUSTOMERS, live_rules, run_history
 from kai.models import Chatbot, Connector, Customer, CustomerRule, Membership, Run, RunScore, StepType, Tenant, User, Workflow, WorkflowVersion
@@ -25,8 +26,51 @@ def _upgrade() -> None:
     raise RuntimeError(f"database is not ready: {last}")
 
 
-def _draft(graph: dict, contract: dict, suite: list, config: dict) -> dict:
-    return {"graph": graph, "chat_contract": contract, "stories": suite, "eval_config": config}
+def _draft(graph: dict, contract: dict, suite: list, config: dict, built_from: str = "") -> dict:
+    from kai.engine.never import with_forbidden
+    from kai.engine.slots import sync_try_prompts
+
+    synced = sync_try_prompts(dict(contract or {}))
+    synced["never"] = [with_forbidden(rule) if isinstance(rule, dict) else rule for rule in (synced.get("never") or [])]
+    payload = {
+        "graph": graph,
+        "chat_contract": synced,
+        "stories": suite,
+        "eval_config": config,
+    }
+    if built_from:
+        payload["built_from"] = built_from
+    return payload
+
+
+def _add_workflow(session, package: dict, built_from: str = "") -> None:
+    draft = _draft(package["graph"], package["chat_contract"], package["stories"], package["eval_config"], built_from=built_from)
+    contract = draft["chat_contract"]
+    row = Workflow(
+        id=package["key"],
+        tenant_id="demo",
+        chatbot_id="bot",
+        key=package["key"],
+        name=package["name"],
+        summary=package["summary"],
+        group_name=package["group"],
+        channels=package["channels"],
+        draft=draft,
+    )
+    session.add(row)
+    session.flush()
+    published = WorkflowVersion(
+        tenant_id="demo",
+        workflow_id=row.id,
+        version=1,
+        graph=package["graph"],
+        chat_contract=contract,
+        stories=package["stories"],
+        eval_config=package["eval_config"],
+    )
+    session.add(published)
+    session.flush()
+    row.published_version_id = published.id
 
 
 def _rule(item: dict) -> CustomerRule:
@@ -56,6 +100,7 @@ def main() -> None:
         session.flush()
         for item in CUSTOMERS:
             session.add(Customer(id=item["id"], tenant_id="demo", name=item["name"], handle=item["handle"]))
+        session.add(Customer(id="cust-demo-passkey", tenant_id="demo", name="Demo account", handle="demo-passkey"))
         session.flush()
         session.add(Membership(id="mem-demo", tenant_id="demo", user_id="user-demo", role="owner"))
         session.add(Chatbot(id="bot", tenant_id="demo", name="Kai", public_key="demo-key"))
@@ -66,32 +111,9 @@ def main() -> None:
             session.add(Connector(tenant_id="demo", type=item, base_url="", host_allowlist=[]))
 
         for package in packaged:
-            draft = _draft(package["graph"], package["chat_contract"], package["stories"], package["eval_config"])
-            row = Workflow(
-                id=package["key"],
-                tenant_id="demo",
-                chatbot_id="bot",
-                key=package["key"],
-                name=package["name"],
-                summary=package["summary"],
-                group_name=package["group"],
-                channels=package["channels"],
-                draft=draft,
-            )
-            session.add(row)
-            session.flush()
-            published = WorkflowVersion(
-                tenant_id="demo",
-                workflow_id=row.id,
-                version=1,
-                graph=package["graph"],
-                chat_contract=package["chat_contract"],
-                stories=package["stories"],
-                eval_config=package["eval_config"],
-            )
-            session.add(published)
-            session.flush()
-            row.published_version_id = published.id
+            _add_workflow(session, package)
+        for package in demo_bundles():
+            _add_workflow(session, package, built_from="demo")
         for item in live_rules():
             session.add(_rule(item))
         session.flush()
@@ -132,7 +154,7 @@ def main() -> None:
                     reasons=item["reasons"],
                 )
             )
-    print("seeded tenant demo, workflow low-balance-top-up, rule LR-3120, api key demo-key")
+    print("seeded tenant demo, catalog, six demos, rule LR-3120, api key demo-key")
 
 
 if __name__ == "__main__":

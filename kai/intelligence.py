@@ -13,6 +13,12 @@ WORKFLOW_ORDER = [
     "jit-card-topup",
     "individual-onboarding",
     "business-onboarding",
+    "demo-balance",
+    "demo-alert",
+    "demo-move",
+    "demo-login",
+    "demo-choose",
+    "demo-list",
 ]
 
 ENDED_ON = {
@@ -29,6 +35,47 @@ def ended_label(result: Optional[str]) -> str:
     if not result:
         return ""
     return ENDED_ON.get(result, result.replace("_", " "))
+
+
+def run_ended_on(row: dict[str, Any]) -> str:
+    """Human label for the Runs table — never leave waiting runs blank."""
+    ended = str(row.get("ended_on") or "").strip() or ended_label(row.get("result"))
+    if ended:
+        return ended
+    status = str(row.get("status") or "").strip()
+    step = str(row.get("step_id") or "").strip()
+    if status == "waiting":
+        return f"waiting · {step}" if step else "waiting"
+    if status and status not in {"completed", "blocked"}:
+        return f"{status} · {step}" if step else status
+    return step or ""
+
+
+def turns_for_run(record: dict[str, Any], turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep chat-audit turns that fall inside this run — not the whole conversation."""
+    start = record.get("started_at")
+    end = record.get("finished_at")
+    workflow_id = str(record.get("workflow_id") or "")
+    matched: list[dict[str, Any]] = []
+    for turn in turns:
+        ts = turn.get("created_at")
+        if start is not None and ts is not None:
+            # Child run starts after the chat turn that launched it — keep a short lookback.
+            if ts < start - timedelta(seconds=45):
+                continue
+            latest = end + timedelta(seconds=1) if end is not None else start + timedelta(minutes=30)
+            if ts > latest:
+                continue
+        key = str(turn.get("workflow_key") or "")
+        if key and workflow_id and key != workflow_id and turn.get("action") == "start":
+            continue
+        # Anything after the graph finished is the next idle turn (except a late-stamped choice).
+        if end is not None and ts is not None and ts > end:
+            if turn.get("action") != "choice" and turn.get("route") != "choice":
+                continue
+        cleaned = {name: value for name, value in turn.items() if name != "created_at"}
+        matched.append(cleaned)
+    return matched
 
 
 def started_label(value: Optional[datetime]) -> str:
@@ -126,7 +173,7 @@ def _decorate_run(row: dict[str, Any]) -> dict[str, Any]:
         "origin": row.get("origin") or "",
         "rule_id": row.get("rule_id") or "",
         "rule_code": row.get("rule_code") or "",
-        "ended_on": row.get("ended_on") or ended_label(row.get("result")),
+        "ended_on": run_ended_on(row),
         "chat": show_score(row.get("chat")),
         "outcome": show_score(row.get("outcome")),
         "flagged": bool(row.get("flagged")),

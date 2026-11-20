@@ -50,7 +50,29 @@ class RunWorkflow:
         steps = {step["id"]: step for step in graph["steps"]}
         state = initial_state(graph, payload["origin"], payload.get("slots") or {})
         timings: dict[str, float] = {}
-        events: list[dict[str, Any]] = []
+        entry = ((graph.get("entries") or {}).get(payload.get("origin") or "chat") or state.get("step_id") or "")
+        start_event = {
+            "type": "start",
+            "step_id": entry or "start",
+            "payload": {
+                "origin": payload.get("origin") or "chat",
+                "workflow_id": payload.get("workflow_id") or "",
+                "slots": payload.get("slots") or {},
+                "conversation_id": payload.get("conversation_id") or "",
+                "confidence": payload.get("confidence"),
+                "intent_source": payload.get("intent_source") or "",
+                "band": payload.get("band") or "",
+            },
+        }
+        events: list[dict[str, Any]] = [start_event]
+        state.setdefault("events", [])
+        state["events"].insert(0, start_event)
+        await workflow.execute_activity(
+            "record_event",
+            {"tenant_id": payload["tenant_id"], "run_id": payload["run_id"], "event": start_event},
+            start_to_close_timeout=TASK_TIMEOUT,
+            activity_id=f"{payload['run_id']}:start",
+        )
         replies: list[str] = []
         self.view = _public(state)
         while state["status"] not in {"completed", "blocked"}:
@@ -103,6 +125,29 @@ class RunWorkflow:
                 if text is not None:
                     replies.append(text)
                 port = reply_port(step, text, state["slots"], graph)
+                event = {
+                    "type": "reply" if text is not None else "timeout",
+                    "step_id": step["id"],
+                    "text": text,
+                    "port": port,
+                    "payload": {
+                        "text": text,
+                        "port": port,
+                        "kind": step.get("kind") or "",
+                        "type": step.get("type") or "",
+                    },
+                }
+                events.append(event)
+                await workflow.execute_activity(
+                    "record_event",
+                    {
+                        "tenant_id": payload["tenant_id"],
+                        "run_id": payload["run_id"],
+                        "event": event,
+                    },
+                    start_to_close_timeout=TASK_TIMEOUT,
+                    activity_id=f"{payload['run_id']}:{step['id']}:{event['type']}:{len(events)}",
+                )
                 state = drive(
                     state,
                     graph,
@@ -110,7 +155,7 @@ class RunWorkflow:
                         "step_id": step["id"],
                         "port": port,
                         "data": reply_slots(step, text, state["slots"], graph),
-                        "event": {"type": "reply" if text is not None else "timeout", "step_id": step["id"], "text": text, "port": port},
+                        "event": event,
                     },
                 )
             else:
@@ -119,6 +164,10 @@ class RunWorkflow:
             timings[step["id"]] = max(timings.get(step["id"], 0), (workflow.now() - started).total_seconds() * 1000)
             self.view = _public(state)
             self.view["prompt"] = None
+            # Persist terminal status before speaking so the parent chat does not treat
+            # the next message as an answer to an already-finished run (e.g. Other → austria).
+            if state["status"] in {"completed", "blocked"}:
+                await self._persist(payload, state, timings, events, replies)
             await self._speak_new(payload, state)
         await self._persist(payload, state, timings, events, replies)
         return self.view
@@ -140,6 +189,7 @@ class RunWorkflow:
                     "conversation_id": payload.get("conversation_id"),
                     "role": "kai",
                     "text": text,
+                    "never": ((payload.get("contract") or {}).get("never") or []),
                 },
                 activity_id=f"{payload['run_id']}:line:{self._spoken_count}:{index}",
                 start_to_close_timeout=TASK_TIMEOUT,
@@ -168,7 +218,7 @@ class RunWorkflow:
                 "missing_slot_count": payload.get("missing_slot_count") or 0,
                 "customer_id": payload.get("customer_id"),
                 "rule_id": payload.get("rule_id"),
-                "events": events,
+                "events": list(state.get("events") or events or []),
                 "graph": payload["graph"] if state["status"] == "completed" else None,
                 "contract": payload.get("contract") if state["status"] == "completed" else None,
                 "eval_config": payload.get("eval_config") if state["status"] == "completed" else None,
@@ -256,8 +306,11 @@ class ConversationWorkflow:
                 self.phase = "idle"
                 self.objection_count = 0
                 self.objection_step = ""
+                self.chosen = None
                 self.view["prompt"] = None
+                self.view["workflow_key"] = None
                 self._refresh_view()
+                # Fall through and treat this message as a fresh idle turn.
             else:
                 prompt = waiting.get("prompt") or {}
                 step_id = str(prompt.get("step_id") or "")
@@ -271,7 +324,22 @@ class ConversationWorkflow:
                 if decision.get("action") == "choice" and (decision.get("text") or decision.get("port")):
                     self.objection_count = 0
                     self.objection_step = ""
-                    if await self._forward_if_busy(decision.get("text") or decision.get("port")):
+                    forwarded = await self._forward_if_busy(decision.get("text") or decision.get("port"))
+                    if forwarded:
+                        # If the choice ended the run (Other, reject, …), clear parent state
+                        # so the next message is not matched against a stale waiting prompt.
+                        check = await workflow.execute_activity(
+                            "waiting_prompt",
+                            {"run_id": self.child_id, "graph": (self.chosen or {}).get("graph") or {}},
+                            start_to_close_timeout=TASK_TIMEOUT,
+                        )
+                        if check.get("finished"):
+                            self.child_id = None
+                            self.phase = "idle"
+                            self.chosen = None
+                            self.view["prompt"] = None
+                            self.view["workflow_key"] = None
+                            self._refresh_view()
                         return
                 if decision.get("action") == "start" and decision.get("workflow_key"):
                     self.objection_count = 0
@@ -284,7 +352,11 @@ class ConversationWorkflow:
                     )
                     await self._follow(payload, loaded, decision)
                     return
-                await self._say(payload, self._spoken({"contracts": []}, decision) or prompt.get("text") or "")
+                spoken = self._spoken({"contracts": [self.chosen] if self.chosen else []}, decision)
+                prompt_line = str(decision.get("reask") or prompt.get("text") or "").strip()
+                if spoken and prompt_line and prompt_line not in spoken and decision.get("action") in {"answer", "chat"}:
+                    spoken = f"{spoken} {prompt_line}".strip()
+                await self._say(payload, spoken or prompt_line)
                 return
         loaded = await workflow.execute_activity(
             "load_contracts",
@@ -295,7 +367,7 @@ class ConversationWorkflow:
         await self._follow(payload, loaded, decision)
 
     async def _leave_run(self, payload: dict[str, Any], prompt: dict[str, Any]) -> None:
-        """Drop the open run so a different published workflow can start."""
+        """Drop the open run so a different chat workflow can start."""
         ports = set(prompt.get("ports") or [])
         for choice in prompt.get("choices") or []:
             if isinstance(choice, dict) and choice.get("port"):
@@ -336,6 +408,8 @@ class ConversationWorkflow:
                     "prompt": prompt or {},
                     "conversation_id": payload.get("conversation_id") or "",
                     "tenant_id": payload.get("tenant_id") or "",
+                    "persona": payload.get("persona") or "guest",
+                    "customer_id": payload.get("customer_id") or "",
                     "objection_count": self.objection_count,
                     "objection_step": self.objection_step,
                 },
@@ -353,7 +427,13 @@ class ConversationWorkflow:
             match = next((item for item in loaded.get("contracts") or [] if (item.get("ledger") or {}).get("accounts")), None)
         ledger = decision.get("ledger") or (match or {}).get("ledger") or {}
         pending = self.pending_slot if self.phase == "slot" else ""
-        line = grounded_reply(decision, ledger, pending or "")
+        line = grounded_reply(
+            decision,
+            ledger,
+            pending or "",
+            filled=self.partial,
+            text=str(decision.get("model_input") or ""),
+        )
         idle = idle_line([self.chosen] if self.chosen else [])
         return line or decision.get("reply") or (slot_question(pending, ((self.chosen or {}).get("contract") or {}).get("slots")) if pending else idle)
 
@@ -372,6 +452,7 @@ class ConversationWorkflow:
         band = decide_band(float(decision.get("confidence") or 0), contract.get("bands") or {})
         self.view["band"] = band
         self.view["confidence"] = decision.get("confidence")
+        self.view["source"] = decision.get("source") or ""
         self.view["workflow_key"] = match["workflow_key"]
         switching = self.chosen is not None and self.chosen.get("workflow_key") != match["workflow_key"]
         if self.chosen is None or (switching and band == "start"):
@@ -380,14 +461,22 @@ class ConversationWorkflow:
                 return
             if self.chosen is None and band == "ask" and not decision.get("slots"):
                 entry = ((match.get("graph") or {}).get("entries") or {}).get("chat") or "chat_request"
-                await self._say(payload, (contract.get("lines") or {}).get(entry) or contract.get("setup") or "Do you want to top an account up?")
+                ask_line = str(contract.get("setup") or "").strip() or (contract.get("lines") or {}).get(entry) or "Is that what you want me to do?"
+                await self._say(payload, ask_line)
                 return
             if switching:
                 self.partial = {}
                 self.slot_from = {}
             self.chosen = match
+        allowed = {
+            str(slot.get("key") or "")
+            for slot in ((match.get("contract") if match else None) or (self.chosen or {}).get("contract") or {}).get("slots") or []
+            if slot.get("key")
+        }
         for name, item in (decision.get("slots") or {}).items():
             if item.get("value") in (None, ""):
+                continue
+            if allowed and name not in allowed:
                 continue
             if name in self.partial and name != self.pending_slot and self.phase == "slot":
                 continue
@@ -413,6 +502,17 @@ class ConversationWorkflow:
         run_id = f"run:{payload['tenant_id']}:{workflow.uuid4()}"
         self.child_id = run_id
         missing_count = sum(1 for key, source in self.slot_from.items() if source == "asked")
+        booked = await workflow.execute_activity(
+            "booked_ledger",
+            {
+                "conversation_id": payload.get("conversation_id") or "",
+                "ledger": chosen.get("ledger") or {},
+                "contracts": [chosen] if chosen else [],
+            },
+            start_to_close_timeout=TASK_TIMEOUT,
+            activity_id=f"{payload['conversation_id']}:ledger:{run_id}",
+        )
+        ledger = (booked or {}).get("ledger") or chosen.get("ledger") or {}
         await workflow.start_child_workflow(
             RunWorkflow.run,
             {
@@ -425,10 +525,15 @@ class ConversationWorkflow:
                 "eval_config": chosen.get("eval_config") or {},
                 "origin": "chat",
                 "slots": self.partial,
-                "ledger": chosen.get("ledger") or {},
+                "ledger": ledger,
                 "conversation_id": payload["conversation_id"],
+                "customer_id": payload.get("customer_id") or "",
+                "persona": payload.get("persona") or "guest",
                 "slots_from_message": {key: value for key, value in self.partial.items() if self.slot_from.get(key) == "the message"},
                 "missing_slot_count": missing_count,
+                "confidence": self.view.get("confidence"),
+                "intent_source": (self.view.get("source") or ""),
+                "band": self.view.get("band") or "",
             },
             id=run_id,
             parent_close_policy=workflow.ParentClosePolicy.ABANDON,
@@ -462,6 +567,11 @@ class ConversationWorkflow:
         if not text:
             return
         self.view.setdefault("messages", []).append(text)
+        never = ((self.chosen or {}).get("contract") or {}).get("never") or []
+        for item in payload.get("contracts") or []:
+            if isinstance(item, dict) and item.get("contract"):
+                never = never or (item.get("contract") or {}).get("never") or []
+                break
         await workflow.execute_activity(
             "append_message",
             {
@@ -469,6 +579,7 @@ class ConversationWorkflow:
                 "conversation_id": payload["conversation_id"],
                 "role": "kai",
                 "text": text,
+                "never": never,
             },
             activity_id=f"{payload['conversation_id']}:kai:{self.signal_count}:{len(self.view.get('messages') or [])}",
             start_to_close_timeout=TASK_TIMEOUT,

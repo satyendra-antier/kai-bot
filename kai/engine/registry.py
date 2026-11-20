@@ -1,4 +1,4 @@
-"""The 9 kinds and 26 step types shared by every workflow."""
+"""The 9 kinds and shared step types for money canvases (Add step / Settings)."""
 
 KINDS = [
     "source",
@@ -43,7 +43,18 @@ STEP_TYPES = [
     _type("first_time", "condition", "First time", ["true", "false"], "told once for this drop", "Has this already happened for the same event — so a customer is told once, not every posting.", "first_time", {"event": "<event>", "last_time": None}, {"result": "yes | no"}),
     _type("origin", "condition", "Came from", ["true", "false"], "which source started the run", "Which source started the run, when the path after depends on it.", "origin", {"origin": "chat | rule"}, {"result": "yes | no"}),
     _type("confirm", "ask", "Read back", ["yes", "no"], "nothing starts without a yes", "Kai reads the whole request back. Nothing starts without a yes.", "confirm", {"request": {}}, {"confirmed": True}),
-    _type("offer", "ask", "Offer a choice", ["continue", "yes", "no"], "the customer picks one", "Kai offers a list of values and the customer picks one.", "offer", {"amount": 0, "can_cover": []}, {"options": [], "chosen": "<account>"}),
+    _type(
+        "ask_options",
+        "ask",
+        "Ask with options",
+        ["continue"],
+        "the customer picks from a list",
+        "Kai asks a question and shows a fixed list (like Demo list residence/funds). Each option is a port on the canvas.",
+        "ask_options",
+        {"ask": "Where do you live?", "type": "simple_select", "options": [{"label": "Germany", "port": "germany"}, {"label": "Other", "port": "other"}]},
+        {"chosen": "<port>", "label": "<label>"},
+    ),
+    _type("offer", "ask", "Offer a choice", ["continue", "yes", "no"], "the customer picks one", "Kai offers a list of values and the customer picks one — usually account options from a fetch.", "offer", {"amount": 0, "can_cover": []}, {"options": [], "chosen": "<account>"}),
     _type("approve_money", "approval", "Approve a money move", ["approve", "reject"], "amount, source, and rate", "The approval card: amount, source, rate, fee and balances after. The quote re-quotes on open.", "approve_money", {"amount": 0, "from": "<account>", "to": "<account>", "quote_id": "<id>"}, {"decision": "approve | reject", "by": "<@handle>"}),
     _type("approve_next", "approval", "Approve the next step", ["approve", "reject"], "the customer agrees to what comes next", "The customer agrees to what comes next, but nothing moves here.", "approve_next", {"next": "<what comes next>"}, {"decision": "approve | reject"}),
     _type("move_money", "action", "Move money", ["continue"], "a Move between the customer's balances", "Runs a Move between the customer's own balances — at Kai's rate, or internal when the asset is the same.", "move_money", {"send": 0, "from": "<account>", "to": "<account>", "quote_id": "<id>"}, {"received": 0, "ref": "<ref>"}),

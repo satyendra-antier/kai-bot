@@ -137,17 +137,7 @@ def resolve_fetch(step: dict[str, Any], slots: dict[str, Any], ledger: dict[str,
         rows.sort(key=lambda row: row["code"])
         return {"candidates": rows}
     if role == "get_move_quote":
-        amount = num(slots.get("amount"))
-        rate = float(ledger.get("rate") or 1.08)
-        fee = float(ledger.get("fee") or 0)
-        est_amount = round(amount * rate - fee, 2)
-        est = _money({"amount": est_amount, "currency": _currency_of(slots.get("target"), accounts)})
-        return {
-            "rate": rate,
-            "fee": fee,
-            "est": est,
-            "quote_ttl": int(ledger.get("quote_ttl") or 30),
-        }
+        return _move_quote(slots, ledger, accounts)
     if role == "get_rate":
         rate = float(slots.get("rate_now") if slots.get("rate_now") is not None else ledger.get("rate") or 0)
         return {"rate": rate, "rate_now": rate}
@@ -240,11 +230,33 @@ def drive(state: dict[str, Any], graph: dict[str, Any], observation: dict[str, A
             port = _condition_port(step, state["slots"])
             if _edge(graph, step["id"], port) is None:
                 port = _existing_port(graph, step["id"], "continue")
+            state["events"].append(
+                {
+                    "type": "condition",
+                    "step_id": step["id"],
+                    "port": port,
+                    "payload": {
+                        "port": port,
+                        "role": _role(step),
+                        "type": step.get("type") or "",
+                        "kind": kind,
+                    },
+                }
+            )
             if not _jump(state, graph, step, port):
                 return state
             continue
         if kind == "keep_matching":
-            if not _jump(state, graph, step, _pick(step, state["slots"])):
+            port = _pick(step, state["slots"])
+            state["events"].append(
+                {
+                    "type": "pick",
+                    "step_id": step["id"],
+                    "port": port,
+                    "payload": {"port": port, "role": _role(step), "kind": kind},
+                }
+            )
+            if not _jump(state, graph, step, port):
                 return state
             continue
         if kind == "fetch":
@@ -761,15 +773,70 @@ def format_money(amount: float, currency: str) -> str:
     return f"{number} {currency}".strip()
 
 
+def _amount_currency(amount: Any, fallback: str = "") -> str:
+    if isinstance(amount, dict) and amount.get("currency"):
+        return str(amount["currency"]).upper()
+    return str(fallback or "").upper()
+
+
+def _move_quote(slots: dict[str, Any], ledger: dict[str, Any], accounts: dict[str, Any]) -> dict[str, Any]:
+    """Build send/est for a mock move. Amount currency decides which side is fixed."""
+    raw_amount = slots.get("amount")
+    amount = num(raw_amount)
+    rate = float(ledger.get("rate") or 1.08)
+    fee = float(ledger.get("fee") or 0)
+    source = str(slots.get("source") or "")
+    target = str(slots.get("target") or "")
+    source_ccy = _currency_of(source, accounts).upper()
+    target_ccy = _currency_of(target, accounts).upper()
+    amount_ccy = _amount_currency(raw_amount, source_ccy or target_ccy)
+
+    if not amount:
+        send = _money({"amount": 0, "currency": source_ccy or amount_ccy or "USD"})
+        est = _money({"amount": 0, "currency": target_ccy or amount_ccy or "USD"})
+    elif source_ccy and target_ccy and source_ccy == target_ccy:
+        # Internal same-asset move — 1:1.
+        send = _money({"amount": amount, "currency": source_ccy})
+        est = _money({"amount": amount, "currency": target_ccy})
+    elif amount_ccy and target_ccy and amount_ccy == target_ccy and amount_ccy != source_ccy:
+        # "Top up EUR with €65 from USDT" — arrival fixed; debit source at rate.
+        est = _money({"amount": amount, "currency": target_ccy})
+        send = _money({"amount": round(amount * rate + fee, 2), "currency": source_ccy or "USD"})
+    else:
+        # "Top up USD with €100 from EUR" — send fixed in source; convert to target.
+        send = _money({"amount": amount, "currency": source_ccy or amount_ccy or "USD"})
+        est = _money({"amount": round(amount * rate - fee, 2), "currency": target_ccy or "USD"})
+
+    return {
+        "rate": rate,
+        "fee": fee,
+        "send": send,
+        "est": est,
+        "quote_ttl": int(ledger.get("quote_ttl") or 30),
+    }
+
+
 def apply_move(ledger: dict[str, Any], slots: dict[str, Any]) -> dict[str, Any]:
     """Debit the source and credit what the quote said would arrive."""
     accounts = ledger.get("accounts") or {}
     source = str(slots.get("source") or "")
     target = str(slots.get("target") or "")
-    taken = num(slots.get("amount"))
+    taken = num(slots.get("send") if slots.get("send") not in (None, "") else slots.get("amount"))
     arrival = num(slots.get("est"))
     if arrival <= 0 and taken:
-        arrival = round(taken * float(ledger.get("rate") or 1), 2)
+        source_ccy = _currency_of(source, accounts).upper()
+        target_ccy = _currency_of(target, accounts).upper()
+        amount_ccy = _amount_currency(slots.get("amount"), source_ccy)
+        rate = float(ledger.get("rate") or 1)
+        if source_ccy and target_ccy and source_ccy == target_ccy:
+            arrival = taken
+        elif amount_ccy and target_ccy and amount_ccy == target_ccy and amount_ccy != source_ccy:
+            # Amount was target-fixed; taken is source debit — arrival is the EUR/USD/… amount.
+            arrival = num(slots.get("amount"))
+            if arrival <= 0 and rate:
+                arrival = round(taken / rate, 2)
+        else:
+            arrival = round(taken * rate, 2)
     if source in accounts and taken:
         row = accounts[source]
         row["amount"] = round(float(row.get("amount") or 0) - taken, 2)

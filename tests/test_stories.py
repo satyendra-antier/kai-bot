@@ -8,9 +8,10 @@ from kai.engine.topup import PREVIEW_LEDGER, chat_contract, low_balance_topup_gr
 
 def test_registry_counts():
     assert len(KINDS) == 9
-    assert len(STEP_TYPES) == 26
+    assert len(STEP_TYPES) == 27
     assert len({item["kind"] for item in STEP_TYPES}) == 9
     by_type = {item["type"]: item for item in STEP_TYPES}
+    assert by_type["ask_options"]["input"]["type"] == "simple_select"
     assert by_type["enough"]["title"] == "Is there enough"
     assert by_type["enough"]["purpose"] == "spare ≥ amount"
     assert by_type["enough"]["slug"] == "enough"
@@ -98,7 +99,22 @@ def test_publish_gate_and_try_it():
     assert preview["confidence"] == 0.97
     assert preview["trace"][-1] == "offer_account"
     assert "€62.40" in preview["messages"][0]["text"]
-    assert try_utterance(draft, "send 50 to @dana")["band"] == "not_this"
+    excluded = try_utterance(draft, "send 50 to @dana")
+    assert excluded["band"] == "not_this"
+    assert excluded["status"] == "idle"
+    assert excluded["messages"] and "top up" in excluded["messages"][0]["text"].lower()
+    ask_draft = {
+        "graph": low_balance_topup_graph(),
+        "chat_contract": {
+            **chat_contract(),
+            "examples": ["refill my account please"],
+            "exclusions": [],
+            "bands": {"start_at": 0.95, "ask_at": 0.5, "not_this_below": 0.5},
+        },
+    }
+    unsure = try_utterance(ask_draft, "refill my GBP")
+    assert unsure["band"] == "ask"
+    assert unsure["messages"] and "is that what you want" in unsure["messages"][0]["text"].lower()
     assert try_utterance(draft, "refill my GBP")["status"] == "slot"
 
 
@@ -123,6 +139,37 @@ def test_intent_bands_and_slots():
     assert asks_for_accounts("list account")
     assert not asks_for_accounts("top up my account")
     assert not asks_for_accounts("EUR")
+    assert not asks_for_accounts("tell me when my account balannce goes below 50")
+    alert_line = "tell me when my account balannce goes below 50"
+    from kai.engine.slots import sync_try_prompts, wants_alert, looks_like_question
+    from kai.engine.catalog import bundles as catalog_bundles
+
+    assert wants_alert(alert_line)
+    assert not looks_like_question(alert_line)
+    for pack in catalog_bundles():
+        synced = sync_try_prompts(dict(pack["chat_contract"] or {}))
+        prompts = synced.get("try_prompts") or []
+        for sample in (synced.get("examples") or []) + (synced.get("exclusions") or []):
+            assert sample in prompts
+    packs = {item["key"]: item for item in catalog_bundles()}
+    alert_pack = packs["low-balance-alert"]
+    sweep_pack = packs["sweep-between-accounts"]
+    assert score_intent(alert_line, alert_pack["chat_contract"]) > score_intent(alert_line, contract)
+    assert score_intent(alert_line, contract) <= 0.35
+    move_line = "Move €50 from EUR to USDT"
+    assert score_intent(move_line, sweep_pack["chat_contract"]) > score_intent(move_line, contract)
+    alert_contracts = [
+        {
+            "workflow_key": "low-balance-alert",
+            "workflow_id": "low-balance-alert",
+            "contract": alert_pack["chat_contract"],
+            "ledger": alert_pack["chat_contract"]["preview_ledger"],
+        }
+    ]
+    alerted = fallback_turn(alert_line, alert_contracts, {"phase": "idle"})
+    assert alerted["action"] == "start"
+    assert alerted["workflow_key"] == "low-balance-alert"
+    assert alerted["needs"] == "none"
     listed = describe_accounts(chat_contract()["preview_ledger"], "what is available ?")
     assert "EUR €62.40" in listed and "CARD €18.40" in listed
     assert describe_accounts(chat_contract()["preview_ledger"], "list my card") == "Your card is CARD €18.40."
@@ -153,6 +200,94 @@ def test_intent_bands_and_slots():
     assert funded["action"] == "answer" and funded["needs"] == "accounts"
     euros = fallback_turn("from the euro account", published, {"phase": "slot", "pending_slot": "source", "workflow_key": "low-balance-top-up", "filled": {"target": "USD"}})
     assert euros["action"] == "fill" and euros["slots"]["source"]["value"] == "EUR"
+    fx_pack = packs["fx-rate-watch"]
+    fx_contracts = [
+        {
+            "workflow_key": "fx-rate-watch",
+            "workflow_id": "fx-rate-watch",
+            "contract": fx_pack["chat_contract"],
+            "ledger": fx_pack["chat_contract"]["preview_ledger"],
+        }
+    ]
+    fx_full = extract_slots("Tell me when EUR/USD goes above 1.10")
+    assert fx_full["pair"]["value"] == "EUR/USD"
+    assert fx_full["target_rate"]["value"] == 1.1
+    assert "target" not in fx_full and "amount" not in fx_full
+    fx_start = fallback_turn("Tell me when EUR/USD goes above 1.10", fx_contracts, {"phase": "idle"})
+    assert fx_start["action"] == "start"
+    assert fx_start["slots"]["pair"]["value"] == "EUR/USD"
+    assert fx_start["slots"]["target_rate"]["value"] == 1.1
+    fx_pair = fallback_turn(
+        "EUR/USD",
+        fx_contracts,
+        {"phase": "slot", "pending_slot": "pair", "workflow_key": "fx-rate-watch", "filled": {}},
+    )
+    assert fx_pair["action"] == "fill" and fx_pair["slots"]["pair"]["value"] == "EUR/USD"
+    assert "target" not in fx_pair["slots"]
+    fx_rate = fallback_turn(
+        "1.10",
+        fx_contracts,
+        {"phase": "slot", "pending_slot": "target_rate", "workflow_key": "fx-rate-watch", "filled": {"pair": "EUR/USD"}},
+    )
+    assert fx_rate["slots"]["target_rate"]["value"] == 1.1
+    alert_slots = extract_slots("Let me know if my GBP account goes under £50")
+    assert alert_slots["account"]["value"] == "GBP"
+    assert alert_slots["threshold"]["value"] == 50.0
+    card_alert = extract_slots("Tell me when my card drops below €20")
+    assert card_alert["account"]["value"] == "CARD"
+    assert card_alert["threshold"]["value"] == 20.0
+    threshold_only = fallback_turn(
+        "£50",
+        alert_contracts,
+        {"phase": "slot", "pending_slot": "threshold", "workflow_key": "low-balance-alert", "filled": {"account": "GBP"}},
+    )
+    assert threshold_only["action"] == "fill" and threshold_only["slots"]["threshold"]["value"] == 50.0
+    assert fallback_turn("asdfghjkl", list(alert_contracts) + fx_contracts + published, {"phase": "idle"})["action"] == "chat"
+    assert decide_band(score_intent("tell me when", alert_pack["chat_contract"]), alert_pack["chat_contract"]["bands"]) == "ask"
+    assert decide_band(score_intent("transfer please", sweep_pack["chat_contract"]), sweep_pack["chat_contract"]["bands"]) != "start"
+
+
+def test_natural_alerts_prefer_product_over_demo_alert():
+    from kai.engine.catalog import bundles as catalog_bundles
+    from kai.engine.demos import bundles as demo_bundles
+
+    packs = {item["key"]: item for item in catalog_bundles()}
+    demos = {item["key"]: item for item in demo_bundles()}
+    alert_pack = packs["low-balance-alert"]
+    demo_alert = demos["demo-alert"]
+    contracts = [
+        {
+            "workflow_key": "low-balance-alert",
+            "workflow_id": "low-balance-alert",
+            "contract": alert_pack["chat_contract"],
+            "ledger": alert_pack["chat_contract"]["preview_ledger"],
+        },
+        {
+            "workflow_key": "demo-alert",
+            "workflow_id": "demo-alert",
+            "contract": demo_alert["chat_contract"],
+            "ledger": demo_alert["chat_contract"]["preview_ledger"],
+        },
+    ]
+    under = "tell me when my account goes under 50 EUR"
+    above = "tell me when it goes up to 65"
+    assert score_intent(under, alert_pack["chat_contract"], workflow_key="low-balance-alert") > score_intent(
+        under, demo_alert["chat_contract"], workflow_key="demo-alert"
+    )
+    assert score_intent(above, demo_alert["chat_contract"], workflow_key="demo-alert") < 0.5
+    started = fallback_turn(under, contracts, {"phase": "idle"})
+    assert started["action"] == "start"
+    assert started["workflow_key"] == "low-balance-alert"
+    assert started["slots"]["account"]["value"] == "EUR"
+    assert started["slots"]["threshold"]["value"] == 50.0
+    follow = fallback_turn(above, contracts, {"phase": "idle"})
+    assert follow["action"] == "start"
+    assert follow["workflow_key"] == "low-balance-alert"
+    assert follow["slots"]["threshold"]["value"] == 65.0
+    assert extract_slots(above)["direction"]["value"] == "above"
+    demo_only = fallback_turn("demo alert", contracts, {"phase": "idle"})
+    assert demo_only["action"] == "start"
+    assert demo_only["workflow_key"] == "demo-alert"
 
 
 def test_a_new_workflow_can_be_run():

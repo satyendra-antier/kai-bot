@@ -1,4 +1,4 @@
-"""Upsert the three demo workflows and two scored runs each. Does not reseed."""
+"""Upsert the six demo workflows and two scored runs each. Does not reseed."""
 
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ def main() -> None:
                 "chat_contract": package["chat_contract"],
                 "stories": package["stories"],
                 "eval_config": package["eval_config"],
+                "built_from": "demo",
             }
             row = session.get(Workflow, package["key"])
             if row is None:
@@ -64,21 +65,21 @@ def main() -> None:
                 row.group_name = package["group"]
                 row.channels = list(package["channels"])
                 row.draft = draft
-            if not row.published_version_id:
-                published = WorkflowVersion(
-                    tenant_id="demo",
-                    workflow_id=row.id,
-                    version=1,
-                    graph=package["graph"],
-                    chat_contract=package["chat_contract"],
-                    stories=package["stories"],
-                    eval_config=package["eval_config"],
-                    created_at=now,
-                )
-                session.add(published)
-                session.flush()
-                row.published_version_id = published.id
-            version_id = row.published_version_id
+            current = session.query(WorkflowVersion).filter(WorkflowVersion.workflow_id == row.id).count()
+            published = WorkflowVersion(
+                tenant_id="demo",
+                workflow_id=row.id,
+                version=current + 1,
+                graph=package["graph"],
+                chat_contract=package["chat_contract"],
+                stories=package["stories"],
+                eval_config=package["eval_config"],
+                created_at=now,
+            )
+            session.add(published)
+            session.flush()
+            row.published_version_id = published.id
+            version_id = published.id
             by_id = {story["id"]: story for story in package["stories"]}
             for index, story_id in enumerate(package["sample_runs"], start=1):
                 story = by_id[story_id]

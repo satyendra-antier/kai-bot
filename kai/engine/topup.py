@@ -137,6 +137,7 @@ def low_balance_topup_graph() -> dict:
 
 def chat_contract() -> dict:
     return {
+        "setup": "I can top up an account from another balance. Is that what you want?",
         "description": "The customer wants money moved from one of their accounts onto another account or their card, because they asked to top it up, refill it, or add a sum to it.",
         "examples": [
             "Top up my USD with €100 from EUR",
@@ -156,13 +157,16 @@ def chat_contract() -> dict:
         "lines": LINES,
         "never": [
             {"id": "msg_before_approval", "mode": "order", "text": "A customer-facing message before the approval event"},
-            {"id": "no_guaranteed_profit", "mode": "judged", "text": "Never promise a profit", "forbidden": ["guaranteed profit"]},
+            {"id": "no_guaranteed_profit", "mode": "judged", "text": "Never promise a profit", "forbidden": ["guaranteed profit", "guaranteed return"]},
+            {"id": "no_invent_balance", "mode": "judged", "text": "Never invent a balance Kai did not read", "forbidden": ["you have €999", "you have $999"]},
+            {"id": "no_external", "mode": "judged", "text": "Never send to an external handle", "forbidden": ["sent to @", "sending to @"]},
         ],
         "try_prompts": [
             "Top up my USD with €100 from EUR",
-            "top up my card with 50 from GBP",
-            "top up USD with 100 from USDT",
-            "refill my GBP",
+            "Top up my card with €50 from EUR",
+            "My dollar account is almost empty, move 200 from euros",
+            "Refill USDT from GBP",
+            "Add 50 to my GBP account",
             "send 50 to @dana",
         ],
         "preview_ledger": PREVIEW_LEDGER,

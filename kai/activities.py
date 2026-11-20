@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -14,8 +15,9 @@ from temporalio import activity
 
 from kai.db import session_scope
 from kai.engine.advance import apply_move, render_line, resolve_action, resolve_fetch
+from kai.engine.audit import run_event, turn_trail
 from kai.engine.scoring import score_run
-from kai.engine.slots import HELP, accept_model, extract_slots, fallback_turn, greeting_reply, idle_line, pinned_turn, score_intent
+from kai.engine.slots import HELP, accept_model, extract_slots, fallback_turn, greeting_reply, idle_line, pinned_turn, score_intent, sync_try_prompts
 from kai.engine.tools import _OPT_IN, _OPT_OUT, apply_guard, redact_pii, select_tool
 from kai.intelligence import ended_label, next_run_code
 from kai.gemini import classify as gemini_classify
@@ -41,7 +43,7 @@ def _publish(conversation_id: str | None, payload: dict) -> None:
 
 
 def _contract_row(row, graph: dict, contract: dict, eval_config: dict, version_id: str) -> dict:
-    contract = contract or {}
+    contract = sync_try_prompts(dict(contract or {}))
     return {
         "workflow_id": row.id,
         "workflow_key": row.key,
@@ -51,6 +53,14 @@ def _contract_row(row, graph: dict, contract: dict, eval_config: dict, version_i
         "eval_config": eval_config or {},
         "ledger": contract.get("preview_ledger") or {"accounts": {}},
     }
+
+
+def _chat_ready(graph: dict, channels: list | None, pinned_here: bool) -> bool:
+    if pinned_here:
+        return True
+    if "chat" not in (channels or []):
+        return False
+    return bool(((graph or {}).get("entries") or {}).get("chat"))
 
 
 @activity.defn(name="load_contracts")
@@ -66,12 +76,17 @@ def load_contracts(payload: dict) -> dict:
             if pinned_here or draft.get("graph"):
                 if not pinned_here and not row.published_version_id:
                     continue
-                contracts.append(_contract_row(row, draft.get("graph") or {}, draft.get("chat_contract") or {}, draft.get("eval_config") or {}, "draft"))
+                graph = draft.get("graph") or {}
+                if not _chat_ready(graph, row.channels, pinned_here):
+                    continue
+                contracts.append(_contract_row(row, graph, draft.get("chat_contract") or {}, draft.get("eval_config") or {}, "draft"))
                 continue
             if not row.published_version_id:
                 continue
             version = session.get(WorkflowVersion, row.published_version_id)
             if version is None:
+                continue
+            if not _chat_ready(version.graph or {}, row.channels, pinned_here):
                 continue
             contracts.append(_contract_row(row, version.graph, version.chat_contract, version.eval_config, version.id))
     return {"contracts": contracts}
@@ -84,8 +99,9 @@ def classify_intent(payload: dict) -> dict:
     best = None
     best_score = -1.0
     for item in contracts:
-        score = score_intent(text, item["contract"])
-        if score > best_score:
+        score = score_intent(text, item["contract"], workflow_key=item.get("workflow_key") or "")
+        product = 0 if str(item.get("workflow_key") or "").startswith("demo-") else 1
+        if score > best_score or (score == best_score and product and best and str(best.get("workflow_key") or "").startswith("demo-")):
             best_score = score
             best = item
     if gemini_enabled():
@@ -108,7 +124,7 @@ def classify_intent(payload: dict) -> dict:
             "workflow_id": "",
             "version_id": "",
             "confidence": 0,
-            "reason": "no published workflow matched",
+            "reason": "no chat workflow matched",
             "source": "deterministic",
         }
     return {
@@ -116,7 +132,7 @@ def classify_intent(payload: dict) -> dict:
         "workflow_id": best["workflow_id"],
         "version_id": best["version_id"],
         "confidence": best_score,
-        "reason": "matched the published description",
+        "reason": "matched the chat description",
         "source": "deterministic",
     }
 
@@ -210,36 +226,110 @@ def resolve_turn(payload: dict) -> dict:
     state = _turn_state(payload, contracts)
     pinned = pinned_turn(text, contracts, state)
     if pinned:
+        pinned = dict(pinned)
+        pinned["source"] = "pinned"
+        pinned["ai_steps"] = turn_trail(
+            pii=[],
+            tool=select_tool(text) or "",
+            chosen=pinned,
+            route="pinned",
+        )
         return pinned
     local = fallback_turn(text, contracts, state)
     shown, kinds = redact_pii(text)
     local["model_input"] = shown
     local["pii"] = kinds
     local["tool"] = select_tool(text) or ""
+    local["source"] = "deterministic"
     if gemini_enabled():
-        accepted = accept_model(gemini_interpret(shown, _turn_catalog(contracts), state), text, contracts, state)
+        raw = gemini_interpret(shown, _turn_catalog(contracts), state)
+        accepted = accept_model(raw, text, contracts, state)
         if accepted:
+            accepted = dict(accepted)
+            accepted["source"] = "gemini"
             if accepted["action"] in {"chat", "answer"} and accepted["needs"] == "none" and not accepted.get("reply"):
                 accepted["reply"] = local.get("reply") or greeting_reply(text) or idle_line(contracts)
             strong_local = local["action"] in {"start", "fill"} and local["confidence"] >= 0.75
             pending = state.get("pending_slot") or ""
             if strong_local and pending == "amount" and "amount" in (local.get("slots") or {}):
+                local["ai_steps"] = turn_trail(pii=kinds, tool=local["tool"], local=local, model=accepted, model_used=True, chosen=local, route="local_amount")
                 return local
             if strong_local and pending and pending in (local.get("slots") or {}) and pending not in (accepted.get("slots") or {}):
+                local["ai_steps"] = turn_trail(pii=kinds, tool=local["tool"], local=local, model=accepted, model_used=True, chosen=local, route="local_slot")
+                return local
+            from kai.engine.slots import asks_capacity
+
+            # Mid-slot "how much can I move?" — prefer a capacity answer over a full account dump.
+            if local.get("action") == "answer" and local.get("needs") == "capacity" and asks_capacity(text):
+                local["model_input"] = shown
+                local["pii"] = kinds
+                local["ai_steps"] = turn_trail(pii=kinds, tool=local["tool"], local=local, model=accepted, model_used=True, chosen=local, route="local_capacity")
                 return local
             if accepted["needs"] != "none":
+                if asks_capacity(text) and accepted.get("needs") == "accounts":
+                    accepted["needs"] = "capacity"
+                accepted["model_input"] = shown
+                accepted["pii"] = kinds
+                accepted["tool"] = local["tool"]
+                accepted["ai_steps"] = turn_trail(pii=kinds, tool=local["tool"], local=local, model=accepted, model_used=True, chosen=accepted, route="model_needs")
                 return accepted
-            if strong_local and accepted["action"] in {"chat", "answer"} and not accepted.get("slots"):
+            local_key = str(local.get("workflow_key") or "")
+            demo_local = local_key.startswith("demo-") and "demo" not in (text or "").lower()
+            if (
+                strong_local
+                and accepted["action"] in {"chat", "answer"}
+                and not accepted.get("slots")
+                and not demo_local
+            ):
+                local["ai_steps"] = turn_trail(pii=kinds, tool=local["tool"], local=local, model=accepted, model_used=True, chosen=local, route="local_beats_chat")
                 return local
-            if accepted["action"] in {"start", "fill"} and local["confidence"] > accepted["confidence"]:
+            if (
+                accepted["action"] in {"start", "fill"}
+                and local["confidence"] > accepted["confidence"]
+                and not (demo_local and not str(accepted.get("workflow_key") or "").startswith("demo-"))
+            ):
                 accepted["confidence"] = local["confidence"]
                 accepted["workflow_key"] = accepted["workflow_key"] or local["workflow_key"]
+            # Prefer a product start from Gemini over a demo start from the local scorer.
+            if (
+                demo_local
+                and accepted["action"] == "start"
+                and accepted.get("workflow_key")
+                and not str(accepted.get("workflow_key") or "").startswith("demo-")
+            ):
+                accepted["model_input"] = shown
+                accepted["pii"] = kinds
+                accepted["tool"] = local["tool"]
+                accepted["ai_steps"] = turn_trail(pii=kinds, tool=local["tool"], local=local, model=accepted, model_used=True, chosen=accepted, route="model_over_demo")
+                return accepted
             accepted["model_input"] = shown
             accepted["pii"] = kinds
             accepted["tool"] = local["tool"]
+            accepted["ai_steps"] = turn_trail(pii=kinds, tool=local["tool"], local=local, model=accepted, model_used=True, chosen=accepted, route="model")
             return accepted
+        local["ai_steps"] = turn_trail(
+            pii=kinds,
+            tool=local["tool"],
+            local=local,
+            model_used=False,
+            model_skipped="Gemini returned nothing usable",
+            chosen=local,
+            route="local_fallback",
+        )
+        if local["action"] in {"chat", "answer"} and local["needs"] == "none" and not local.get("reply"):
+            local["reply"] = greeting_reply(text) or idle_line(contracts)
+        return local
     if local["action"] in {"chat", "answer"} and local["needs"] == "none" and not local.get("reply"):
         local["reply"] = greeting_reply(text) or idle_line(contracts)
+    local["ai_steps"] = turn_trail(
+        pii=kinds,
+        tool=local["tool"],
+        local=local,
+        model_used=False,
+        model_skipped="Gemini is off",
+        chosen=local,
+        route="local",
+    )
     return local
 
 
@@ -256,8 +346,54 @@ def _tenant_for(conversation_id: str) -> str:
         return str(row.tenant_id) if row is not None else ""
 
 
-@activity.defn(name="interpret_turn")
-def interpret_turn(payload: dict) -> dict:
+def _profile_for_turn(payload: dict, contracts: list[dict]) -> dict:
+    profile = _chat_profile(
+        payload.get("conversation_id") or "",
+        persona=str(payload.get("persona") or "guest"),
+        customer_id=str(payload.get("customer_id") or ""),
+    )
+    for item in contracts:
+        rate = (item.get("ledger") or {}).get("rate")
+        if rate not in (None, ""):
+            profile["rate"] = rate
+            break
+    return profile
+
+
+def _early_tool_guard(text: str, profile: dict, contracts: list[dict]) -> dict | None:
+    """Resolve read-tools / guest money denials before Gemini — stamps a Tool step on the run."""
+    from kai.engine.slots import wants_alert
+    from kai.engine.tools import ACCOUNT_TOOLS, _money
+
+    tool = select_tool(text)
+    decision: dict[str, Any] = {"action": "chat", "workflow_key": "", "confidence": 0, "slots": {}, "needs": "none", "reply": ""}
+    if tool in ACCOUNT_TOOLS | {"profile", "opt_out", "opt_in", "price"}:
+        pass
+    elif not profile.get("account") and (
+        wants_alert(text)
+        or re.search(
+            r"\b(top\s*up|topup|move|transfer|sweep|fx rate|exchange|send money|watch.*(rate|account|balance))\b",
+            text or "",
+            re.I,
+        )
+    ):
+        money_key = next((item.get("workflow_key") for item in contracts if _money({"workflow_key": item.get("workflow_key")}, contracts)), "")
+        if money_key:
+            decision = {"action": "start", "workflow_key": money_key, "confidence": 0.9, "slots": {}, "needs": "none", "reply": ""}
+        else:
+            return None
+    else:
+        return None
+    return apply_guard(
+        text,
+        decision,
+        profile,
+        contracts,
+        kill_switch=os.environ.get("KAI_KILL_SWITCH") == "1",
+    )
+
+
+def _interpret_turn_body(payload: dict) -> dict:
     from kai.conversation_graph import run_conversation
 
     contracts = list(payload.get("contracts") or [])
@@ -273,29 +409,41 @@ def interpret_turn(payload: dict) -> dict:
     phase = state.get("phase") or "idle"
     pinned = bool(state.get("opened_workflow_key")) and phase in {"idle", "", None} and not state.get("pending_slot")
     shown, kinds = redact_pii(payload.get("text") or "")
+    open_prompt = bool(prompt)
+    if not pinned and not open_prompt and phase in {"idle", "", None} and not state.get("pending_slot"):
+        profile = _profile_for_turn(payload, contracts)
+        early = _early_tool_guard(payload.get("text") or "", profile, contracts)
+        if early:
+            early["ai_steps"] = turn_trail(
+                pii=kinds,
+                tool=select_tool(payload.get("text") or "") or "",
+                chosen=early,
+                route="guard",
+                guard=early,
+            )
+            early["route"] = "guard"
+            early["source"] = "guard"
+            early["model_input"] = shown
+            early["pii"] = kinds
+            early["tool"] = select_tool(payload.get("text") or "") or ""
+            return _stamp_turn(payload.get("conversation_id") or "", payload.get("text") or "", early)
     decision = run_conversation(
         {**turn_payload, "pinned": pinned, "workflow_key": state.get("workflow_key") or ""},
         resolve_turn,
     )
-    steps = [{"id": "redact", "label": "Redact", "detail": ", ".join(kinds) if kinds else "Nothing held back"}]
-    steps.extend(list(decision.get("ai_steps") or []))
-    if decision.get("source"):
-        steps.append(
-            {
-                "id": "source",
-                "label": "Scorer",
-                "detail": f"{decision.get('source')} · {decision.get('action')} {decision.get('workflow_key') or ''} @ {decision.get('confidence') or 0}".strip(),
-            }
+    steps = list(decision.get("ai_steps") or [])
+    if not steps:
+        steps = turn_trail(
+            pii=kinds,
+            tool=decision.get("tool") or select_tool(payload.get("text") or "") or "",
+            chosen=decision,
+            route=decision.get("route") or phase or "idle",
+            strike=decision.get("strike"),
         )
     replaced = False
-    open_prompt = bool(prompt)
     if not pinned and ((phase in {"idle", "", None} and not state.get("pending_slot")) or open_prompt):
-        profile = _chat_profile(payload.get("conversation_id") or "")
-        for item in contracts:
-            rate = (item.get("ledger") or {}).get("rate")
-            if rate not in (None, ""):
-                profile["rate"] = rate
-                break
+        profile = _profile_for_turn(payload, contracts)
+        before = dict(decision)
         guarded = apply_guard(
             payload.get("text") or "",
             decision,
@@ -304,16 +452,24 @@ def interpret_turn(payload: dict) -> dict:
             kill_switch=os.environ.get("KAI_KILL_SWITCH") == "1",
         )
         if guarded:
-            steps.append(
-                {
-                    "id": "guard",
-                    "label": "Guard",
-                    "detail": f"{guarded.get('action')} {guarded.get('workflow_key') or guarded.get('reply') or ''}".strip(),
-                }
+            steps = turn_trail(
+                pii=kinds,
+                tool=before.get("tool") or "",
+                local=before if before.get("source") == "deterministic" else None,
+                model=before if before.get("source") == "gemini" else None,
+                model_used=before.get("source") == "gemini",
+                chosen=guarded,
+                route=before.get("route") or "guard",
+                guard=guarded,
+                strike=before.get("strike"),
             )
             guarded["ai_steps"] = steps
-            guarded["route"] = decision.get("route") or ""
-            guarded["strike"] = decision.get("strike")
+            guarded["route"] = before.get("route") or decision.get("route") or ""
+            guarded["strike"] = before.get("strike")
+            guarded["source"] = before.get("source") or decision.get("source") or "guard"
+            guarded["model_input"] = before.get("model_input") or shown
+            guarded["pii"] = kinds
+            guarded["tool"] = before.get("tool") or select_tool(payload.get("text") or "") or ""
             decision = guarded
             replaced = True
     if not replaced:
@@ -326,7 +482,41 @@ def interpret_turn(payload: dict) -> dict:
         decision["step_id"] = prompt.get("step_id") or ""
     decision["model_input"] = decision.get("model_input") or shown
     decision["pii"] = kinds
+    # Always expose the selected tool on the decision for Intelligence / LangSmith.
+    decision["tool"] = decision.get("tool") or select_tool(payload.get("text") or "") or ""
+    if decision.get("tool") and decision.get("ai_steps"):
+        ids = {row.get("id") for row in decision["ai_steps"]}
+        if "tool" not in ids:
+            from kai.engine.audit import step as audit_step
+
+            trail = list(decision["ai_steps"])
+            trail.insert(1, audit_step("tool", "Tool", decision["tool"], tool=decision["tool"]))
+            decision["ai_steps"] = trail
     return _stamp_turn(payload.get("conversation_id") or "", payload.get("text") or "", decision)
+
+
+@activity.defn(name="interpret_turn")
+def interpret_turn(payload: dict) -> dict:
+    from kai.config import apply_langsmith_env, langsmith_enabled
+
+    apply_langsmith_env()
+    if langsmith_enabled():
+        try:
+            from langsmith import traceable
+
+            return traceable(
+                name="kai.interpret_turn",
+                run_type="chain",
+                metadata={
+                    "conversation_id": payload.get("conversation_id") or "",
+                    "persona": payload.get("persona") or "guest",
+                    "tool": select_tool(payload.get("text") or "") or "",
+                },
+                tags=["kai", "interpret"],
+            )(_interpret_turn_body)(payload)
+        except Exception:
+            pass
+    return _interpret_turn_body(payload)
 
 
 def _stamp_turn(conversation_id: str, text: str, decision: dict) -> dict:
@@ -336,6 +526,14 @@ def _stamp_turn(conversation_id: str, text: str, decision: dict) -> dict:
     decision["tool"] = decision.get("tool") or select_tool(text) or ""
     if not conversation_id:
         return decision
+    slots = decision.get("slots") or {}
+    slot_summary = {}
+    if isinstance(slots, dict):
+        for key, value in slots.items():
+            if isinstance(value, dict) and "value" in value:
+                slot_summary[key] = value.get("value")
+            else:
+                slot_summary[key] = value
     with session_scope() as session:
         row = (
             session.query(Message)
@@ -353,15 +551,34 @@ def _stamp_turn(conversation_id: str, text: str, decision: dict) -> dict:
                 "step_id": decision.get("step_id") or "",
                 "route": decision.get("route") or "",
                 "strike": decision.get("strike") or 0,
+                "source": decision.get("source") or "",
+                "confidence": decision.get("confidence"),
+                "needs": decision.get("needs") or "none",
+                "port": decision.get("port") or "",
+                "slots": slot_summary,
                 "ai_steps": list(decision.get("ai_steps") or []),
             }
             session.add(row)
     return decision
 
 
-def _chat_profile(conversation_id: str) -> dict[str, Any]:
-    """An account exists only after onboarding in this chat finishes."""
-    profile: dict[str, Any] = {"account": False, "kind": "", "opted_out": False, "ledger": {"accounts": {}}, "rate": None}
+def _chat_profile(conversation_id: str, persona: str = "guest", customer_id: str = "") -> dict[str, Any]:
+    """Guest chats earn an account via onboarding. Logged-in demos start with the preview ledger + completed moves."""
+    from kai.engine.topup import PREVIEW_LEDGER
+
+    mode = (persona or "guest").strip().lower()
+    if mode in {"logged_in", "user", "authenticated"} or customer_id:
+        ledger = _booked_ledger(conversation_id, [{"ledger": PREVIEW_LEDGER}])
+        return {
+            "account": True,
+            "kind": "individual",
+            "opted_out": False,
+            "ledger": ledger,
+            "rate": ledger.get("rate") if ledger.get("rate") is not None else PREVIEW_LEDGER.get("rate"),
+            "customer_id": customer_id or "cust-thomas",
+            "persona": "logged_in",
+        }
+    profile: dict[str, Any] = {"account": False, "kind": "", "opted_out": False, "ledger": {"accounts": {}}, "rate": None, "persona": "guest"}
     if not conversation_id:
         return profile
     with session_scope() as session:
@@ -406,13 +623,19 @@ def _chat_profile(conversation_id: str) -> dict[str, Any]:
 
 def _booked_ledger(conversation_id: str, contracts: list[dict]) -> dict:
     """Preview balances, then every completed move in this chat."""
-    base: dict[str, Any] = {"accounts": {}}
+    from kai.engine.topup import PREVIEW_LEDGER
+
+    base: dict[str, Any] = copy.deepcopy(PREVIEW_LEDGER)
     for item in contracts:
         ledger = item.get("ledger") or {}
         if ledger.get("accounts"):
-            base = ledger
+            base = copy.deepcopy(ledger)
+            # Keep mock FX knobs if a contract ledger omitted them.
+            base.setdefault("rate", PREVIEW_LEDGER.get("rate"))
+            base.setdefault("fee", PREVIEW_LEDGER.get("fee"))
+            base.setdefault("quote_ttl", PREVIEW_LEDGER.get("quote_ttl"))
             break
-    booked = copy.deepcopy(base)
+    booked = base
     if not conversation_id:
         return booked
     with session_scope() as session:
@@ -428,6 +651,15 @@ def _booked_ledger(conversation_id: str, contracts: list[dict]) -> dict:
     return booked
 
 
+@activity.defn(name="booked_ledger")
+def booked_ledger_activity(payload: dict) -> dict:
+    """Ledger for a chat: contract/preview balances with completed moves applied."""
+    contracts = list(payload.get("contracts") or [])
+    if not contracts and payload.get("ledger"):
+        contracts = [{"ledger": payload.get("ledger")}]
+    return {"ledger": _booked_ledger(payload.get("conversation_id") or "", contracts)}
+
+
 @activity.defn(name="waiting_prompt")
 def waiting_prompt(payload: dict) -> dict:
     from kai.engine.prompts import build_prompt
@@ -436,12 +668,18 @@ def waiting_prompt(payload: dict) -> dict:
     graph = payload.get("graph") or {}
     with session_scope() as session:
         row = session.get(Run, payload.get("run_id") or "")
-        if row is None or row.status in {"completed", "blocked"}:
+        if row is None or row.status in {"completed", "blocked"} or row.result:
             return {"finished": True, "prompt": None}
         step = next((item for item in graph.get("steps") or [] if item.get("id") == row.step_id), None)
-        if row.status not in {"waiting", "active"} or step is None:
+        if step is None or step.get("kind") in {"result", "stop"}:
             return {"finished": True, "prompt": None}
-        return {"finished": False, "prompt": build_prompt(step, row.slots or {}, graph)}
+        if row.status not in {"waiting", "active"}:
+            return {"finished": True, "prompt": None}
+        prompt = build_prompt(step, row.slots or {}, graph)
+        # A result/stop node has no customer prompt — treat the run as done even if status lags.
+        if prompt is None and step.get("kind") not in {"ask", "approval", "question", "question_popup"}:
+            return {"finished": True, "prompt": None}
+        return {"finished": False, "prompt": prompt}
 
 
 @activity.defn(name="normal_chat")
@@ -456,45 +694,102 @@ def normal_chat_activity(payload: dict) -> dict:
 
 @activity.defn(name="append_message")
 def append_message(payload: dict) -> dict:
+    from kai.engine.never import scrub_never
+
+    text = payload.get("text") or ""
+    meta = dict(payload.get("payload") or {})
+    if payload.get("role") == "kai":
+        text, breached, phrase = scrub_never(text, payload.get("never") or meta.get("never") or [])
+        if breached:
+            meta["never_breach"] = phrase
     with session_scope() as session:
         session.add(
             Message(
                 tenant_id=payload["tenant_id"],
                 conversation_id=payload["conversation_id"],
                 role=payload["role"],
-                text=payload["text"],
-                payload=payload.get("payload") or {},
+                text=text,
+                payload=meta,
             )
         )
-    _publish(payload.get("conversation_id"), {"role": payload["role"], "text": payload["text"]})
+    _publish(payload.get("conversation_id"), {"role": payload["role"], "text": text})
+    return {"ok": True, "text": text, "never_breach": meta.get("never_breach") or ""}
+
+
+@activity.defn(name="record_event")
+def record_event(payload: dict) -> dict:
+    event = payload.get("event") or {}
+    if not event.get("step_id") or not event.get("type"):
+        return {"ok": False}
+    _store_event(payload, event)
     return {"ok": True}
 
 
-@activity.defn(name="fetch_step")
-def fetch_step(payload: dict) -> dict:
+def _fetch_step_body(payload: dict) -> dict:
     step = payload["step"]
     slots = payload["slots"]
     ledger = payload.get("ledger") or {"accounts": {}}
     data = _fetch_via_connector(payload["tenant_id"], step, slots, ledger)
-    event = {"type": "fetch", "step_id": step["id"], "payload": data, "retries": 0}
+    event = run_event("fetch", step["id"], payload={"data": data, "kind": step.get("kind") or "", "type": step.get("type") or ""})
+    event["payload"] = {**(event.get("payload") or {}), **(data if isinstance(data, dict) else {"data": data})}
     _store_event(payload, event)
     return {"data": data, "event": event}
 
 
-@activity.defn(name="act_step")
-def act_step(payload: dict) -> dict:
+@activity.defn(name="fetch_step")
+def fetch_step(payload: dict) -> dict:
+    from kai.config import apply_langsmith_env, langsmith_enabled
+
+    apply_langsmith_env()
+    step = payload.get("step") or {}
+    if langsmith_enabled():
+        try:
+            from langsmith import traceable
+
+            return traceable(
+                name=f"kai.fetch.{step.get('type') or step.get('id') or 'step'}",
+                run_type="tool",
+                tags=["kai", "fetch", str(step.get("type") or "")],
+            )(_fetch_step_body)(payload)
+        except Exception:
+            pass
+    return _fetch_step_body(payload)
+
+
+def _act_step_body(payload: dict) -> dict:
     step = payload["step"]
     existing = _existing_action(payload["run_id"], step["id"])
     if existing:
-        return {"data": existing, "event": {"type": "action", "step_id": step["id"], "payload": existing, "retries": 1}}
+        event = run_event("action", step["id"], payload=existing, retries=1)
+        return {"data": existing, "event": event}
     move_id = f"move_{payload['run_id']}:{step['id']}"
     ledger = copy.deepcopy(payload.get("ledger") or {})
     data = resolve_action(step, payload["slots"], ledger, move_id)
     if data.get("ok") and _moves_money(step):
         apply_move(ledger, payload.get("slots") or {})
-    event = {"type": "action", "step_id": step["id"], "payload": data, "retries": 0}
+    event = run_event("action", step["id"], payload={**(data if isinstance(data, dict) else {"data": data}), "kind": step.get("kind") or "", "type": step.get("type") or ""})
     _store_event(payload, event)
     return {"data": data, "event": event, "ledger": ledger}
+
+
+@activity.defn(name="act_step")
+def act_step(payload: dict) -> dict:
+    from kai.config import apply_langsmith_env, langsmith_enabled
+
+    apply_langsmith_env()
+    step = payload.get("step") or {}
+    if langsmith_enabled():
+        try:
+            from langsmith import traceable
+
+            return traceable(
+                name=f"kai.action.{step.get('type') or step.get('id') or 'step'}",
+                run_type="tool",
+                tags=["kai", "action", str(step.get("type") or "")],
+            )(_act_step_body)(payload)
+        except Exception:
+            pass
+    return _act_step_body(payload)
 
 
 def _moves_money(step: dict) -> bool:
@@ -566,9 +861,44 @@ def persist_run(payload: dict) -> dict:
             existing.checks = scored["checks"]
             existing.flagged = scored["flagged"]
             existing.reasons = scored["reasons"]
+        _sync_run_events(session, payload["tenant_id"], payload["run_id"], payload.get("events") or [])
     if payload.get("conversation_id") and payload.get("messages"):
         _publish(payload["conversation_id"], {"event": "run", "step_id": payload.get("step_id"), "status": payload.get("status")})
     return {"ok": True}
+
+
+def _sync_run_events(session, tenant_id: str, run_id: str, events: list) -> None:
+    """Persist the full in-memory event trail so conditions/replies survive beside fetch/action."""
+    existing = {
+        (row.type, row.step_id, str((row.payload or {}).get("port") or ""), str((row.payload or {}).get("text") or "")): row
+        for row in session.query(RunEvent).filter(RunEvent.run_id == run_id).all()
+    }
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        step_id = str(event.get("step_id") or "")
+        if not event_type or not step_id:
+            continue
+        body = dict(event.get("payload") or {})
+        if event.get("port") and "port" not in body:
+            body["port"] = event["port"]
+        if event.get("text") is not None and "text" not in body:
+            body["text"] = event["text"]
+        key = (event_type, step_id, str(body.get("port") or ""), str(body.get("text") or ""))
+        if key in existing:
+            continue
+        session.add(
+            RunEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                step_id=step_id,
+                type=event_type,
+                payload=body,
+                retries=int(event.get("retries") or 0),
+                created_at=datetime.utcnow(),
+            )
+        )
 
 
 @activity.defn(name="judge_line")

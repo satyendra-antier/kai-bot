@@ -83,12 +83,12 @@ def test_each_example_starts_only_its_own_workflow():
     for package in packages:
         bands = package["chat_contract"]["bands"]
         for example in package["chat_contract"]["examples"]:
-            own = score_intent(example, package["chat_contract"])
+            own = score_intent(example, package["chat_contract"], workflow_key=package["key"])
             assert decide_band(own, bands) == "start", example
             for other in packages:
                 if other["key"] == package["key"]:
                     continue
-                score = score_intent(example, other["chat_contract"])
+                score = score_intent(example, other["chat_contract"], workflow_key=other["key"])
                 assert decide_band(score, other["chat_contract"]["bands"]) != "start", (example, other["key"], score)
 
 

@@ -287,7 +287,11 @@ export default function Intelligence({ onOpenWorkflow, focusWorkflow }) {
             </header>
             <p>{picked.workflow_name}</p>
             <p className="hint">{picked.origin === "rule" ? `Rule · ${picked.rule_code}` : "Chat"}{picked.conversation_id ? ` · ${picked.conversation_id}` : ""}{picked.step_id ? ` · at ${picked.step_id}` : ""} · {picked.ended_on || picked.status}</p>
+            {picked.confidence != null && picked.confidence !== "" ? (
+              <p className="hint">Intent confidence {picked.confidence}{picked.intent_source ? ` · ${picked.intent_source}` : ""}{picked.checks?.chat != null ? ` · eval chat ${picked.checks.chat}` : ""}</p>
+            ) : null}
             <h3>Scores</h3>
+            <p className="hint">Chat checks (intent, slots, turns, lines, guardrails / Kai never) and outcome checks (right end, speed, finished, no errors). Guardrails 0 flags the run.</p>
             {CHECKS.filter((item) => picked.origin === "chat" || item[2] === "outcome").map(([key, label]) => {
               const value = picked.checks?.[key];
               if (value == null) return null;
@@ -298,22 +302,37 @@ export default function Intelligence({ onOpenWorkflow, focusWorkflow }) {
                 </div>
               );
             })}
-            <h3>Sent to the model</h3>
+            {(picked.reasons || []).length ? <p className="hint">Flagged · {(picked.reasons || []).join(", ")}</p> : null}
+            <h3>Chat audit · each turn</h3>
             {(picked.turns || []).length ? (
               <ol className="llm-flow">
                 {picked.turns.map((turn, index) => {
                   const seen = turn.model_input || "";
                   const same = seen === (turn.text || "");
                   const steps = turn.ai_steps || [];
+                  const slotText = turn.slots && Object.keys(turn.slots).length
+                    ? Object.entries(turn.slots).map(([key, value]) => `${key}=${typeof value === "object" ? JSON.stringify(value) : value}`).join(", ")
+                    : "";
                   return (
                     <li key={index}>
                       <div className="llm-step"><span>1 · You typed</span><p>{turn.text}</p></div>
-                      <div className="llm-step"><span>2 · Sanitized input</span><p>{seen || "—"}</p><small>{same ? "Nothing was removed. This is the text passed to the model." : "Email, phone, and card numbers were replaced. This is the text passed to the model."}</small></div>
+                      <div className="llm-step"><span>2 · Sanitized input</span><p>{seen || "—"}</p><small>{same ? "Nothing was removed." : "Email, phone, and card numbers were replaced."}</small></div>
                       <div className="llm-step"><span>3 · Held back</span><p>{(turn.pii || []).length ? turn.pii.join(", ") : "Nothing"}</p></div>
-                      <div className="llm-step"><span>4 · Model chose</span><p>{[turn.action || "chat", turn.tool, turn.workflow_key, turn.step_id].filter(Boolean).join(" · ")}</p></div>
+                      <div className="llm-step">
+                        <span>4 · Outcome</span>
+                        <p>{[turn.action || "chat", turn.source, turn.tool, turn.workflow_key, turn.step_id, turn.port].filter(Boolean).join(" · ")}</p>
+                        <small>
+                          {[
+                            turn.confidence != null && turn.confidence !== "" ? `confidence ${turn.confidence}` : "",
+                            turn.needs && turn.needs !== "none" ? `needs ${turn.needs}` : "",
+                            turn.route ? `route ${turn.route}` : "",
+                            slotText ? `slots ${slotText}` : "",
+                          ].filter(Boolean).join(" · ") || "—"}
+                        </small>
+                      </div>
                       {steps.length ? (
                         <div className="llm-step">
-                          <span>5 · How Kai decided</span>
+                          <span>5 · Decision trail</span>
                           <ol className="ai-steps">
                             {steps.map((step, stepIndex) => (
                               <li key={`${step.id || "step"}-${stepIndex}`}>
@@ -330,16 +349,16 @@ export default function Intelligence({ onOpenWorkflow, focusWorkflow }) {
                 })}
               </ol>
             ) : (
-              <p className="hint">A live chat records each message here. Seeded history rows have scores only, because they were not sent to the model.</p>
+              <p className="hint">Live chat turns stamp redact → local/Gemini → route → guard → decision on each user message. Seeded history rows have scores only.</p>
             )}
-            <h3>From start to finish</h3>
-            <p className="hint">The name is the step id on the canvas. The type is a registry step. A name like is_low is not a new kind.</p>
+            <h3>Run audit · graph hops</h3>
+            <p className="hint">Every hop on the canvas: start, conditions, fetches, asks/replies, actions, results. Ports and tool payloads are kept on the event.</p>
             {(picked.flow || []).length ? (
               <ol className="run-flow">
                 {picked.flow.map((step, index) => (
                   <li key={`${step.id}-${index}`}>
                     <span>{index + 1} · {step.id}</span>
-                    <b>{step.kind_label} · {step.type_label}</b>
+                    <b>{step.kind_label} · {step.type_label}{step.port ? ` · ${step.port}` : ""}</b>
                     <p>{step.detail}</p>
                   </li>
                 ))}
@@ -347,7 +366,7 @@ export default function Intelligence({ onOpenWorkflow, focusWorkflow }) {
             ) : (picked.trace || []).length ? (
               <ol className="path">{picked.trace.map((step) => <li key={step}>{step}</li>)}</ol>
             ) : (
-              <p className="hint">This history row keeps the scores. A live run stores the step path here.</p>
+              <p className="hint">This history row keeps the scores. A live run stores the step path and RunEvent audit here.</p>
             )}
             {(picked.messages || []).length ? (
               <>

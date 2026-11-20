@@ -10,7 +10,7 @@ from typing import Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -18,14 +18,15 @@ from temporalio.client import Client
 from temporalio.common import SearchAttributeKey, SearchAttributePair, TypedSearchAttributes
 from temporalio.service import RPCError
 
-from kai.config import TASK_QUEUE, TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE
+from kai.config import TASK_QUEUE, TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, langsmith_enabled
 from kai.db import session_scope
 from kai.engine.flow import explain_run
 from kai.intelligence import rules_payload, runs_payload
 from kai.models import Chatbot, Conversation, Customer, CustomerRule, Message, Run, RunEvent, RunScore, StepType, Workflow, WorkflowVersion
-from kai.engine.catalog import bundles
+from kai.engine.catalog import bundles, stub_graph
 from kai.engine.registry import KINDS, STEP_TYPES
 from kai.engine.scoring import rollup_checks
+from kai.engine.slots import sync_try_prompts
 from kai.engine.topup import PREVIEW_LEDGER, eval_config
 from kai.service import preview_run, require_weights, rescore, story_failures, trace_story, try_utterance
 from kai.workflows import ConversationWorkflow, RunWorkflow
@@ -37,6 +38,8 @@ DEMO_CONVERSATION = "demo"
 class MessageIn(BaseModel):
     text: str
     workflow_id: Optional[str] = None
+    persona: Optional[str] = "guest"
+    customer_id: Optional[str] = None
 
 
 class DraftIn(BaseModel):
@@ -131,6 +134,62 @@ def _client(app_state) -> Client:
     return app_state.temporal
 
 
+@app.get("/ops", response_class=HTMLResponse)
+async def ops_page():
+    return _OPS_HTML
+
+
+@app.get("/v1/ops")
+async def ops_json(bot: Chatbot = Depends(tenant_bot), session: Session = Depends(get_session)):
+    health_checks = await health()
+    workflows = session.query(Workflow).filter(Workflow.tenant_id == bot.tenant_id).order_by(Workflow.name).all()
+    run_count = session.query(Run).filter(Run.tenant_id == bot.tenant_id).count()
+    event_count = session.query(RunEvent).filter(RunEvent.tenant_id == bot.tenant_id).count()
+    message_count = session.query(Message).filter(Message.tenant_id == bot.tenant_id).count()
+    return {
+        "health": health_checks,
+        "langsmith": {"enabled": langsmith_enabled(), "project": "kai-bot"},
+        "temporal": {
+            "namespace": TEMPORAL_NAMESPACE,
+            "task_queue": TASK_QUEUE,
+            "address": TEMPORAL_ADDRESS,
+            "workflow_types": ["ConversationWorkflow", "RunWorkflow"],
+            "ui": "http://localhost:8081",
+            "note": "Catalog money workflows live in Postgres. Temporal only runs ConversationWorkflow (chat router) and RunWorkflow (one graph walk).",
+        },
+        "databases": {
+            "kai": {
+                "gui": "http://localhost:8082",
+                "system": "PostgreSQL",
+                "server": "postgresql",
+                "user": "kai",
+                "password": "kai",
+                "database": "kai",
+                "host_port": 5433,
+            },
+            "temporal": {
+                "gui": "http://localhost:8082",
+                "user": "temporal",
+                "password": "temporal",
+                "note": "Temporal auto-setup DBs on the same Postgres (temporal / temporal_visibility).",
+            },
+        },
+        "urls": {
+            "chat": "http://localhost:3000/chat",
+            "admin": "http://localhost:3000/admin/",
+            "docs": "http://localhost:3000/docs",
+            "health": "http://localhost:3000/health",
+            "ops": "http://localhost:3000/ops",
+            "temporal_ui": "http://localhost:8081",
+            "adminer": "http://localhost:8082",
+            "redis": "localhost:6380",
+        },
+        "endpoints": _endpoint_catalog(),
+        "catalog_workflows": [{"id": row.id, "key": row.key, "name": row.name, "channels": row.channels, "published": bool(row.published_version_id)} for row in workflows],
+        "counts": {"workflows": len(workflows), "runs": run_count, "run_events": event_count, "messages": message_count},
+    }
+
+
 @app.get("/health")
 async def health():
     checks = {"api": "ok", "postgres": "down", "redis": "down", "temporal": "down", "worker": "down"}
@@ -161,7 +220,10 @@ async def health():
 
 @app.get("/chat")
 def chat_page():
-    return FileResponse(ROOT / "static" / "chat.html")
+    return FileResponse(
+        ROOT / "static" / "chat.html",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.get("/v1/workflows")
@@ -194,17 +256,17 @@ def create_workflow(body: WorkflowIn, bot: Chatbot = Depends(tenant_bot), sessio
         group_name = template.group_name or ""
         built_from = template.id
     else:
-        channels = body.channels or ["chat", "rule"]
-        graph = {"budget": 40, "entries": {}, "steps": [], "edges": []}
+        channels = body.channels or ["chat"]
+        graph = stub_graph(["chat"], done_line=f"{name} is ready.")
         contract = {
             "description": name,
-            "examples": [name],
+            "examples": [],
             "exclusions": [],
             "bands": {"start_at": 0.75, "ask_at": 0.5, "not_this_below": 0.5},
             "slots": [],
-            "lines": {},
+            "lines": {"done": f"{name} is ready."},
             "never": [],
-            "try_prompts": [name],
+            "try_prompts": [],
             "preview_ledger": PREVIEW_LEDGER,
         }
         suite = []
@@ -246,6 +308,11 @@ def delete_workflow(workflow_id: str, bot: Chatbot = Depends(tenant_bot), sessio
     row = _workflow_for(session, bot.tenant_id, workflow_id)
     if not (row.draft or {}).get("built_from"):
         raise HTTPException(status_code=409, detail="only a workflow built from a template can be deleted")
+    run_ids = [run.id for run in session.query(Run.id).filter(Run.tenant_id == bot.tenant_id, Run.workflow_id == row.id).all()]
+    if run_ids:
+        session.query(RunScore).filter(RunScore.tenant_id == bot.tenant_id, RunScore.run_id.in_(run_ids)).delete(synchronize_session=False)
+        session.query(RunEvent).filter(RunEvent.tenant_id == bot.tenant_id, RunEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
+        session.query(Run).filter(Run.tenant_id == bot.tenant_id, Run.workflow_id == row.id).delete(synchronize_session=False)
     session.delete(row)
     return {"deleted": row.id}
 
@@ -254,22 +321,23 @@ def delete_workflow(workflow_id: str, bot: Chatbot = Depends(tenant_bot), sessio
 async def run_workflow_now(workflow_id: str, body: RunIn, bot: Chatbot = Depends(tenant_bot), session: Session = Depends(get_session)):
     row = _workflow_for(session, bot.tenant_id, workflow_id)
     origin = body.origin if body.origin in {"chat", "rule"} else "chat"
-    preview = preview_run(row.draft or {}, body.text, origin)
+    draft = row.draft or {}
+    preview = preview_run(draft, body.text, origin)
     live = None
-    version = session.get(WorkflowVersion, row.published_version_id) if row.published_version_id else None
-    if version is not None and app.state.temporal is not None:
+    if app.state.temporal is not None and (draft.get("graph") or {}).get("entries"):
         run_id = f"run:{bot.tenant_id}:{uuid4()}"
+        contract = draft.get("chat_contract") or {}
         payload = {
             "tenant_id": bot.tenant_id,
             "run_id": run_id,
             "workflow_id": row.id,
-            "version_id": version.id,
-            "graph": version.graph,
-            "contract": version.chat_contract,
-            "eval_config": version.eval_config,
+            "version_id": row.published_version_id or "",
+            "graph": draft.get("graph") or {},
+            "contract": contract,
+            "eval_config": draft.get("eval_config") or {},
             "origin": origin,
             "slots": {"origin": origin},
-            "ledger": (version.chat_contract or {}).get("preview_ledger") or {"accounts": {}},
+            "ledger": contract.get("preview_ledger") or {"accounts": {}},
             "slots_from_message": {},
             "missing_slot_count": 0,
         }
@@ -292,7 +360,7 @@ def save_draft(workflow_id: str, body: DraftIn, bot: Chatbot = Depends(tenant_bo
         draft["graph"] = body.graph
     if body.chat_contract is not None:
         draft["chat_contract"] = body.chat_contract
-        _apply_lines(draft)
+        _apply_contract(draft)
     if body.stories is not None:
         draft["stories"] = body.stories
     if body.eval_config is not None:
@@ -336,7 +404,7 @@ def publish(workflow_id: str, bot: Chatbot = Depends(tenant_bot), session: Sessi
 @app.post("/v1/workflows/{workflow_id}/try")
 def try_it(workflow_id: str, body: TryIn, bot: Chatbot = Depends(tenant_bot), session: Session = Depends(get_session)):
     row = _workflow_for(session, bot.tenant_id, workflow_id)
-    return try_utterance(row.draft or {}, body.text)
+    return try_utterance(row.draft or {}, body.text, workflow_key=row.key or row.id)
 
 
 @app.post("/v1/workflows/{workflow_id}/stories/{story_id}/trace")
@@ -382,21 +450,56 @@ def step_types(bot: Chatbot = Depends(tenant_bot), session: Session = Depends(ge
     for item in STEP_TYPES:
         if item["type"] not in seen:
             types.append(_step_type_json(item["type"], item["kind"], item["title"], item["ports"], item))
+    known = {item["type"] for item in types}
     workflows = session.query(Workflow).filter(Workflow.tenant_id == bot.tenant_id).all()
     used = {item["type"]: [] for item in types}
     untyped = []
+    custom_kind = []
     step_count = 0
+    typed_count = 0
     for workflow in workflows:
         for step in ((workflow.draft or {}).get("graph") or {}).get("steps") or []:
             step_count += 1
-            record = {"workflow": workflow.name, "workflow_id": workflow.id, "id": step.get("id"), "purpose": step.get("purpose") or step.get("title") or ""}
-            if not step.get("type"):
+            record = {
+                "workflow": workflow.name,
+                "workflow_id": workflow.id,
+                "id": step.get("id"),
+                "purpose": step.get("purpose") or step.get("title") or "",
+                "kind": step.get("kind") or "",
+                "type": step.get("type") or "",
+            }
+            step_type = step.get("type") or ""
+            if step_type in known:
+                typed_count += 1
+                used[step_type].append(record)
+            elif step_type:
+                custom_kind.append(record)
+            elif step.get("kind"):
+                # Onboarding canvases use kind-only steps (question, review, …) by design.
+                custom_kind.append(record)
+            else:
                 untyped.append(record)
-            elif step["type"] in used:
-                used[step["type"]].append(record)
     for item in types:
         item["used_as"] = used.get(item["type"], [])
-    return {"kinds": [{"id": kind, "label": kind.replace("_", " ")} for kind in KINDS], "types": types, "untyped": untyped, "steps": step_count, "workflows": len(workflows)}
+        item["usage_count"] = len(item["used_as"])
+    unused = [item["type"] for item in types if not item["used_as"]]
+    return {
+        "kinds": [{"id": kind, "label": kind.replace("_", " ")} for kind in KINDS],
+        "types": types,
+        "untyped": untyped,
+        "custom_kind": custom_kind,
+        "steps": step_count,
+        "workflows": len(workflows),
+        "sync": {
+            "registry_types": len(types),
+            "typed_steps": typed_count,
+            "custom_kind_steps": len(custom_kind),
+            "missing_type_steps": len(untyped),
+            "unused_types": unused,
+            "in_sync": len(untyped) == 0,
+            "note": "Add step / new canvases use the registry types (incl. Ask with options). Onboarding/demo-list also use kind-only question steps. Workflow templates (+ Add workflow) copy a whole draft graph — they are not the same as step types.",
+        },
+    }
 
 
 @app.post("/v1/conversations/{conversation_id}/messages")
@@ -416,7 +519,17 @@ async def post_message(conversation_id: str, body: MessageIn, bot: Chatbot = Dep
         kwargs = {}
         if attributes is not None:
             kwargs["search_attributes"] = attributes
-        started = {"tenant_id": bot.tenant_id, "conversation_id": conversation_id, "chatbot_id": bot.id, "workflow_id": body.workflow_id or ""}
+        persona = (body.persona or "guest").strip().lower() or "guest"
+        if persona not in {"guest", "logged_in"}:
+            persona = "guest"
+        started = {
+            "tenant_id": bot.tenant_id,
+            "conversation_id": conversation_id,
+            "chatbot_id": bot.id,
+            "workflow_id": body.workflow_id or "",
+            "persona": persona,
+            "customer_id": (body.customer_id or "").strip() if persona == "logged_in" else "",
+        }
         try:
             await client.start_workflow(
                 ConversationWorkflow.run,
@@ -463,7 +576,18 @@ async def get_conversation(conversation_id: str, bot: Chatbot = Depends(tenant_b
             child = {}
     return {
         "conversation_id": conversation_id,
-        "messages": [{"role": row.role, "text": row.text} for row in messages],
+        "temporal_id": f"conv:{bot.tenant_id}:{conversation_id}",
+        "messages": [
+            {
+                "role": row.role,
+                "text": row.text,
+                "payload": row.payload or {},
+                "ai_steps": list((row.payload or {}).get("ai_steps") or []),
+                "confidence": (row.payload or {}).get("confidence"),
+                "created_at": row.created_at.isoformat() + "Z" if row.created_at else None,
+            }
+            for row in messages
+        ],
         "live": live,
         "run": child,
     }
@@ -511,6 +635,32 @@ async def fire_rule(rule_id: str, bot: Chatbot = Depends(tenant_bot), session: S
     return {"run_id": run_id}
 
 
+def _run_confidence(events: list, slots: dict) -> float | None:
+    for event in events:
+        if event.get("type") != "start":
+            continue
+        payload = event.get("payload") or {}
+        if payload.get("confidence") is not None and payload.get("confidence") != "":
+            try:
+                return float(payload["confidence"])
+            except (TypeError, ValueError):
+                pass
+    meta = (slots or {}).get("_intent") if isinstance(slots, dict) else None
+    if isinstance(meta, dict) and meta.get("confidence") is not None:
+        try:
+            return float(meta["confidence"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _run_intent_source(events: list) -> str:
+    for event in events:
+        if event.get("type") == "start":
+            return str((event.get("payload") or {}).get("intent_source") or "")
+    return ""
+
+
 def _intelligence_records(session: Session, tenant_id: str) -> tuple:
     workflows = [{"id": row.id, "name": row.name} for row in session.query(Workflow).filter(Workflow.tenant_id == tenant_id).all()]
     customers = {row.id: row for row in session.query(Customer).filter(Customer.tenant_id == tenant_id).all()}
@@ -551,6 +701,8 @@ def _intelligence_records(session: Session, tenant_id: str) -> tuple:
                 "conversation_id": row.conversation_id or "",
                 "step_id": row.step_id or "",
                 "turns": [],
+                "confidence": _run_confidence(events.get(row.id) or [], row.slots or {}),
+                "intent_source": _run_intent_source(events.get(row.id) or []),
                 "flow": explain_run(
                     versions.get(row.version_id) or drafts.get(row.workflow_id) or {},
                     list(row.trace or []),
@@ -561,6 +713,8 @@ def _intelligence_records(session: Session, tenant_id: str) -> tuple:
                 ),
             }
         )
+    from kai.intelligence import turns_for_run
+
     by_conversation: dict[str, list] = {}
     for message in session.query(Message).filter(Message.tenant_id == tenant_id, Message.role == "user").order_by(Message.created_at.asc()).all():
         payload = message.payload or {}
@@ -577,11 +731,17 @@ def _intelligence_records(session: Session, tenant_id: str) -> tuple:
                 "step_id": payload.get("step_id") or "",
                 "route": payload.get("route") or "",
                 "strike": payload.get("strike") or 0,
+                "source": payload.get("source") or "",
+                "confidence": payload.get("confidence"),
+                "needs": payload.get("needs") or "none",
+                "port": payload.get("port") or "",
+                "slots": payload.get("slots") or {},
                 "ai_steps": list(payload.get("ai_steps") or []),
+                "created_at": message.created_at,
             }
         )
     for record in records:
-        record["turns"] = by_conversation.get(record["conversation_id"], [])
+        record["turns"] = turns_for_run(record, by_conversation.get(record["conversation_id"], []))
     return records, workflows
 
 
@@ -655,7 +815,76 @@ def get_run(run_id: str, bot: Chatbot = Depends(tenant_bot), session: Session = 
     if row is None or row.tenant_id != bot.tenant_id:
         raise HTTPException(status_code=404, detail="run not found")
     score = session.query(RunScore).filter(RunScore.run_id == run_id).one_or_none()
-    return _run_json(row, score)
+    events = (
+        session.query(RunEvent)
+        .filter(RunEvent.tenant_id == bot.tenant_id, RunEvent.run_id == run_id)
+        .order_by(RunEvent.created_at.asc())
+        .all()
+    )
+    payload = _run_json(row, score)
+    payload["temporal_id"] = row.temporal_id
+    payload["conversation_id"] = row.conversation_id or ""
+    payload["events"] = [
+        {
+            "step_id": event.step_id,
+            "type": event.type,
+            "payload": event.payload or {},
+            "retries": event.retries,
+            "created_at": event.created_at.isoformat() + "Z" if event.created_at else None,
+        }
+        for event in events
+    ]
+    graph = {}
+    if row.version_id:
+        version = session.get(WorkflowVersion, row.version_id)
+        if version is not None:
+            graph = version.graph or {}
+    if not graph:
+        workflow = session.get(Workflow, row.workflow_id)
+        graph = ((workflow.draft or {}).get("graph") if workflow else {}) or {}
+    payload["flow"] = explain_run(
+        graph,
+        list(row.trace or []),
+        row.slots or {},
+        list(row.messages or []),
+        list(row.user_replies or []),
+        [{"step_id": event.step_id, "type": event.type, "payload": event.payload or {}} for event in events],
+    )
+    if row.conversation_id:
+        from kai.intelligence import turns_for_run
+
+        turns = []
+        for message in (
+            session.query(Message)
+            .filter(Message.tenant_id == bot.tenant_id, Message.conversation_id == row.conversation_id, Message.role == "user")
+            .order_by(Message.created_at.asc())
+            .all()
+        ):
+            body = message.payload or {}
+            if "ai_steps" not in body and "model_input" not in body:
+                continue
+            turns.append(
+                {
+                    "text": message.text,
+                    "confidence": body.get("confidence"),
+                    "action": body.get("action"),
+                    "workflow_key": body.get("workflow_key"),
+                    "source": body.get("source"),
+                    "tool": body.get("tool") or "",
+                    "route": body.get("route") or "",
+                    "ai_steps": list(body.get("ai_steps") or []),
+                    "created_at": message.created_at,
+                }
+            )
+        payload["turns"] = turns_for_run(
+            {
+                "started_at": row.started_at,
+                "finished_at": row.finished_at,
+                "workflow_id": row.workflow_id,
+            },
+            turns,
+        )
+    return payload
 
 
 @app.post("/v1/runs/{run_id}/label")
@@ -700,6 +929,17 @@ def _apply_lines(draft: dict) -> None:
         if step["id"] in lines:
             step["line"] = lines[step["id"]]
     draft["graph"] = graph
+
+
+def _apply_contract(draft: dict) -> None:
+    from kai.engine.never import with_forbidden
+
+    contract = draft.get("chat_contract")
+    if isinstance(contract, dict):
+        rules = contract.get("never") or []
+        contract["never"] = [with_forbidden(rule) if isinstance(rule, dict) else rule for rule in rules]
+        draft["chat_contract"] = sync_try_prompts(contract)
+    _apply_lines(draft)
 
 
 def _workflow_key(name: str, taken: set) -> str:
@@ -756,7 +996,10 @@ def _detail(session: Session, row: Workflow) -> dict:
 
 
 def _workflow_json(row: Workflow, detail: bool = False) -> dict:
-    draft = row.draft or {}
+    draft = copy.deepcopy(row.draft or {})
+    contract = draft.get("chat_contract")
+    if isinstance(contract, dict):
+        draft["chat_contract"] = sync_try_prompts(contract)
     graph = draft.get("graph") or {}
     payload = {
         "id": row.id,
@@ -838,6 +1081,127 @@ def _eval_payload(workflow: Workflow, runs: list[Run], scores: list[RunScore]) -
             if score.run_id in by_run
         ],
     }
+
+
+def _endpoint_catalog() -> list[dict]:
+    return [
+        {"method": "GET", "path": "/health", "auth": False, "use": "Service health"},
+        {"method": "GET", "path": "/ops", "auth": False, "use": "Ops GUI — links, Temporal vs DB, how to verify"},
+        {"method": "GET", "path": "/v1/ops", "auth": True, "use": "JSON ops catalog + counts"},
+        {"method": "GET", "path": "/docs", "auth": False, "use": "OpenAPI / Swagger"},
+        {"method": "GET", "path": "/chat", "auth": False, "use": "Customer chat widget"},
+        {"method": "GET", "path": "/admin/", "auth": False, "use": "Backoffice"},
+        {"method": "GET", "path": "/v1/workflows", "auth": True, "use": "List catalog workflows (Postgres)"},
+        {"method": "GET", "path": "/v1/workflows/{id}", "auth": True, "use": "Workflow draft detail"},
+        {"method": "POST", "path": "/v1/workflows", "auth": True, "use": "Create workflow from template"},
+        {"method": "PUT", "path": "/v1/workflows/{id}/draft", "auth": True, "use": "Save draft (live chat picks this up)"},
+        {"method": "POST", "path": "/v1/workflows/{id}/publish", "auth": True, "use": "Snapshot for rules / eval"},
+        {"method": "POST", "path": "/v1/workflows/{id}/try", "auth": True, "use": "Try-it classifier + preview"},
+        {"method": "POST", "path": "/v1/workflows/{id}/run", "auth": True, "use": "Start RunWorkflow in Temporal"},
+        {"method": "DELETE", "path": "/v1/workflows/{id}", "auth": True, "use": "Delete template-built workflow"},
+        {"method": "POST", "path": "/v1/conversations/{id}/messages", "auth": True, "use": "Chat turn → ConversationWorkflow"},
+        {"method": "GET", "path": "/v1/conversations/{id}", "auth": True, "use": "Messages + ai_steps + live Temporal state"},
+        {"method": "WS", "path": "/v1/conversations/{id}/ws", "auth": False, "use": "Live reply stream (Redis)"},
+        {"method": "POST", "path": "/v1/rules/{id}/fire", "auth": True, "use": "Rule fire → RunWorkflow"},
+        {"method": "GET", "path": "/v1/runs", "auth": True, "use": "Persisted runs (Postgres)"},
+        {"method": "GET", "path": "/v1/runs/{id}", "auth": True, "use": "Run + events + flow + chat turns/ai_steps + scores"},
+        {"method": "POST", "path": "/v1/runs/{id}/label", "auth": True, "use": "Reviewer label + rescore"},
+        {"method": "GET", "path": "/v1/intelligence/runs", "auth": True, "use": "Intelligence runs drawer data"},
+        {"method": "GET", "path": "/v1/intelligence/rules", "auth": True, "use": "Live rules board"},
+        {"method": "GET", "path": "/v1/step-types", "auth": True, "use": "Step type registry"},
+    ]
+
+
+_OPS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kai ops</title>
+  <style>
+    :root { color-scheme: light; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { margin: 0; background: #f8fafc; color: #0f172a; }
+    main { max-width: 920px; margin: 0 auto; padding: 32px 20px 64px; }
+    h1 { font-size: 28px; margin: 0 0 8px; }
+    h2 { font-size: 18px; margin: 28px 0 10px; }
+    p, li { line-height: 1.5; color: #334155; }
+    a { color: #1d4ed8; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 16px; }
+    .card strong { display: block; margin-bottom: 4px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 14px; border-radius: 8px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e2e8f0; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e2e8f0; font-size: 13px; vertical-align: top; }
+    th { background: #f1f5f9; }
+    .ok { color: #047857; font-weight: 600; }
+    .bad { color: #be123c; font-weight: 600; }
+    .hint { font-size: 13px; color: #64748b; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Kai ops</h1>
+  <p class="hint">Verify DB, Temporal, API, and AI audit in one place. API key for JSON: <code>demo-key</code>.</p>
+
+  <h2>Open these</h2>
+  <div class="grid">
+    <div class="card"><strong>Chat</strong><a href="/chat">/chat</a></div>
+    <div class="card"><strong>Backoffice</strong><a href="/admin/">/admin/</a></div>
+    <div class="card"><strong>API docs</strong><a href="/docs">/docs</a></div>
+    <div class="card"><strong>Health</strong><a href="/health">/health</a></div>
+    <div class="card"><strong>Temporal UI</strong><a href="http://localhost:8081" target="_blank" rel="noreferrer">:8081</a><span class="hint"> namespace <code>kai</code></span></div>
+    <div class="card"><strong>DB GUI (Adminer)</strong><a href="http://localhost:8082" target="_blank" rel="noreferrer">:8082</a><span class="hint">System PostgreSQL · Server <code>postgresql</code></span></div>
+  </div>
+
+  <h2>Live health</h2>
+  <pre id="health">Loading…</pre>
+
+  <h2>Database login (Adminer)</h2>
+  <table>
+    <tr><th>Purpose</th><th>Server</th><th>Username</th><th>Password</th><th>Database</th></tr>
+    <tr><td>Kai app data (workflows, runs, messages, scores)</td><td><code>postgresql</code></td><td><code>kai</code></td><td><code>kai</code></td><td><code>kai</code></td></tr>
+    <tr><td>Temporal cluster</td><td><code>postgresql</code></td><td><code>temporal</code></td><td><code>temporal</code></td><td>pick Temporal DBs</td></tr>
+  </table>
+  <p class="hint">From the host, Postgres is also on <code>localhost:5433</code>.</p>
+
+  <h2>Temporal vs catalog workflows</h2>
+  <p><b>Postgres</b> stores the product workflows (<code>low-balance-top-up</code>, alerts, sweeps, demos…). <b>Temporal</b> only runs two workflow types:</p>
+  <ul>
+    <li><code>ConversationWorkflow</code> — id <code>conv:demo:…</code> — chat router, slots, starts children</li>
+    <li><code>RunWorkflow</code> — id <code>run:demo:…</code> — walks one graph; persists <code>runs</code> + <code>run_events</code></li>
+  </ul>
+  <p>So: runs <em>execute</em> in Temporal; the durable record (trace, messages, scores, AI steps) lands in the <code>kai</code> database. Open Temporal UI for live execution; Adminer / Intelligence for the audit trail.</p>
+
+  <h2>Where to see AI steps</h2>
+  <ol>
+    <li>Backoffice → Intelligence → open a run → <b>Chat audit · each turn</b></li>
+    <li><code>GET /v1/conversations/{id}</code> → each user message <code>ai_steps</code></li>
+    <li><code>GET /v1/runs/{id}</code> → <code>turns</code>, <code>events</code>, <code>flow</code>, <code>score.checks</code></li>
+    <li>Optional LangSmith: set <code>LANGSMITH_API_KEY</code> + <code>LANGCHAIN_TRACING_V2=true</code> → LangGraph + Gemini traces at smith.langchain.com</li>
+  </ol>
+
+  <h2>Quick curl</h2>
+  <pre>curl -s http://localhost:3000/health | jq
+curl -s -H 'X-Api-Key: demo-key' http://localhost:3000/v1/ops | jq '.counts, .temporal, .urls'
+curl -s -H 'X-Api-Key: demo-key' http://localhost:3000/v1/workflows | jq '.[].key'</pre>
+
+  <p class="hint">JSON twin of this page: <code>GET /v1/ops</code> with header <code>X-Api-Key: demo-key</code>. Full write-up: <code>OPS.md</code> in the repo.</p>
+</main>
+<script>
+fetch('/health').then(r => r.json()).then(data => {
+  const lines = Object.entries(data.checks || data).map(([k,v]) => {
+    const ok = v === 'ok';
+    return `${ok ? 'OK' : '!!'}  ${k}: ${v}`;
+  });
+  document.getElementById('health').textContent = lines.join('\\n');
+}).catch(err => {
+  document.getElementById('health').textContent = String(err);
+});
+</script>
+</body>
+</html>
+"""
 
 
 admin_dir = ROOT / "static" / "admin"

@@ -61,19 +61,25 @@ def alert_graph() -> dict:
 
 def alert_contract() -> dict:
     return {
-        "setup": "Chat sets up the alert and ends there. The alert comes from the rule; a top-up is handed to Low balance top-up.",
+        "setup": "I can watch a balance and tell you when it goes under a level you set. Is that what you want?",
         "description": "The customer wants to be told when an account, wallet, or card falls below a level they name.",
         "examples": [
             "Let me know if my GBP account goes under £50",
             "Warn me if my USDT wallet goes under 100",
             "Tell me when my card drops below €20",
+            "Tell me when my account balance goes below 50",
         ],
         "exclusions": ["top up my USD"],
         "bands": {"start_at": 0.75, "ask_at": 0.5, "not_this_below": 0.5},
         "idle": "I can top up an account, set a balance rule, or run a sweep. What would you like to do?",
         "slots": [
             {"key": "account", "order": 1, "fill_from": "the account, wallet, or card they name", "ask": "Which account should I watch?"},
-            {"key": "threshold", "order": 2, "fill_from": "the level after under, below, or drops below", "ask": "What level should I watch for?"},
+            {
+                "key": "threshold",
+                "order": 2,
+                "fill_from": "the level after under, below, above, over, up to, or drops below",
+                "ask": "What level should I watch for?",
+            },
         ],
         "lines": {
             "confirm_alert": "I'll tell you when {account} goes under {threshold}.",
@@ -82,12 +88,15 @@ def alert_contract() -> dict:
             "alert_saved": "I'll watch {account}.",
             "cancelled": "Okay, I won't save that alert.",
         },
-        "never": [{"id": "no_move", "mode": "order", "text": "This workflow never moves money"}],
+        "never": [
+            {"id": "no_move", "mode": "judged", "text": "This workflow never moves money", "forbidden": ["i'll move", "i will move", "moved money", "transfer complete", "topped up"]},
+            {"id": "no_invent_balance", "mode": "judged", "text": "Never invent a balance Kai did not read", "forbidden": ["you have €999", "you have $999"]},
+        ],
         "try_prompts": [
             "Let me know if my GBP account goes under £50",
             "Warn me if my USDT wallet goes under 100",
             "Tell me when my card drops below €20",
-            "warn me when my euro balance drops below",
+            "Tell me when my account balance goes below 50",
             "top up my USD",
         ],
         "preview_ledger": PREVIEW_LEDGER,
@@ -153,7 +162,7 @@ def sweep_graph() -> dict:
 
 def sweep_contract() -> dict:
     return {
-        "setup": "Moves money between the customer's own balances. Chat only — a one-off move, no rule.",
+        "setup": "I can move money between your accounts. Is that what you want?",
         "description": "The customer wants to move money from one of their accounts to another, or onto the card.",
         "examples": ["Move €50 from EUR to USDT", "Move €200 from EUR to USD"],
         "exclusions": ["send 50 to @dana"],
@@ -165,8 +174,16 @@ def sweep_contract() -> dict:
             {"key": "target", "order": 3, "fill_from": "the account after to", "ask": "Which account should I move it to?"},
         ],
         "lines": {"confirm_request": "Move {amount} from {source} to {target}. Nothing starts until you say yes.", "moved": "{target} is updated."},
-        "never": [],
-        "try_prompts": ["Move €50 from EUR to USDT"],
+        "never": [
+            {"id": "no_external", "mode": "judged", "text": "Never send to an external handle", "forbidden": ["sent to @", "sending to @"]},
+            {"id": "no_invent_balance", "mode": "judged", "text": "Never invent a balance Kai did not read", "forbidden": ["you have €999", "you have $999"]},
+            {"id": "no_guaranteed_profit", "mode": "judged", "text": "Never promise a profit", "forbidden": ["guaranteed profit", "guaranteed return"]},
+        ],
+        "try_prompts": [
+            "Move €50 from EUR to USDT",
+            "Move €200 from EUR to USD",
+            "send 50 to @dana",
+        ],
         "preview_ledger": PREVIEW_LEDGER,
     }
 
@@ -229,19 +246,30 @@ def fx_graph() -> dict:
 
 def fx_contract() -> dict:
     return {
-        "setup": "Tells the customer when an exchange rate reaches the level they asked for. Nothing is converted here.",
+        "setup": "I can watch an exchange rate and tell you when it reaches a level you name. Is that what you want?",
         "description": "The customer wants to be told when an exchange rate reaches a level they name.",
-        "examples": ["Tell me when EUR/USD goes above 1.10"],
+        "examples": [
+            "Tell me when EUR/USD goes above 1.10",
+            "watch the EUR USD rate and notify me at 1.12",
+        ],
         "exclusions": ["convert 100 euros to dollars"],
         "bands": {"start_at": 0.75, "ask_at": 0.5, "not_this_below": 0.5},
         "idle": "I can top up an account, set a balance rule, or run a sweep. What would you like to do?",
         "slots": [
             {"key": "pair", "order": 1, "fill_from": "the currency pair", "ask": "Which currency pair should I watch?"},
             {"key": "target_rate", "order": 2, "fill_from": "the rate they name", "ask": "What rate should I tell you about?"},
+            {"key": "direction", "order": 3, "fill_from": "", "ask": ""},
         ],
         "lines": {"confirm_watch": "I'll tell you when {pair} goes above {target_rate}."},
-        "never": [],
-        "try_prompts": ["Tell me when EUR/USD goes above 1.10"],
+        "never": [
+            {"id": "no_convert", "mode": "judged", "text": "Never convert or trade here", "forbidden": ["converted", "i'll convert", "trade executed", "bought", "sold"]},
+            {"id": "no_invent_rate", "mode": "judged", "text": "Never invent an exchange rate", "forbidden": ["rate is definitely", "guaranteed rate"]},
+        ],
+        "try_prompts": [
+            "Tell me when EUR/USD goes above 1.10",
+            "watch the EUR USD rate and notify me at 1.12",
+            "convert 100 euros to dollars",
+        ],
         "preview_ledger": PREVIEW_LEDGER,
     }
 

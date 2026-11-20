@@ -1,4 +1,4 @@
-"""Three short workflows for a live demo. They do not replace the seeded seven."""
+"""Six short workflows for a live demo. They do not replace the seeded seven."""
 
 from __future__ import annotations
 
@@ -53,11 +53,11 @@ def alert_graph() -> dict:
             ("get_balance", "fetch", "get_balance", "the account they named", "The balance is {target_balance}.", "get_balance"),
             ("is_low", "condition", "compare", "below 50", None, "compare"),
             ("from_chat", "condition", "origin", "chat sets it up, a rule just tells them", None, "origin"),
-            ("confirm", "ask", "confirm", "read back — nothing saved without a yes", "Tell you when {target} goes under 50?", "confirm"),
+            ("confirm", "ask", "confirm", "read back — nothing saved without a yes", "Tell you when {account} goes under 50?", "confirm"),
             ("saved", "result", "done", "the rule is saved", "Saved. I'll tell you if it drops under 50.", None, "alert_saved"),
             ("declined", "result", "not_done", "they said no", "Okay, I won't save that.", None, "declined"),
             ("still_fine", "result", "nothing", "nothing to say", "It's still above that level.", None, "still_fine"),
-            ("alerted", "result", "done", "the rule told them", "{target} is under 50.", None, "alerted"),
+            ("alerted", "result", "done", "the rule told them", "{account} is under 50.", None, "alerted"),
         ],
         [
             ("chat_request", "start", "continue"),
@@ -107,18 +107,40 @@ def move_graph() -> dict:
     return graph
 
 
-def _contract(description: str, examples: list[str], slots: list[dict] | None = None) -> dict:
-    return {
-        "description": description,
-        "examples": examples,
-        "exclusions": [],
-        "bands": {"start_at": 0.75, "ask_at": 0.5, "not_this_below": 0.5},
-        "slots": slots or [],
-        "lines": {"idle": "", "ask": "", "not_this": "", "source": ""},
-        "never": [],
-        "try_prompts": list(examples),
-        "preview_ledger": PREVIEW_LEDGER,
-    }
+def _contract(
+    description: str,
+    examples: list[str],
+    slots: list[dict] | None = None,
+    exclusions: list[str] | None = None,
+) -> dict:
+    from kai.engine.slots import sync_try_prompts
+
+    return sync_try_prompts(
+        {
+            "description": description,
+            "examples": examples,
+            "exclusions": list(exclusions or []),
+            "bands": {"start_at": 0.75, "ask_at": 0.5, "not_this_below": 0.5},
+            "slots": slots or [],
+            "lines": {"idle": "", "ask": "", "not_this": "", "source": ""},
+            "never": [
+                {
+                    "id": "no_invent_balance",
+                    "mode": "judged",
+                    "text": "Never invent a balance Kai did not read",
+                    "forbidden": ["you have €999", "you have $999"],
+                },
+                {
+                    "id": "no_external",
+                    "mode": "judged",
+                    "text": "Never send to an external handle",
+                    "forbidden": ["sent to @", "sending to @"],
+                },
+            ],
+            "try_prompts": [],
+            "preview_ledger": PREVIEW_LEDGER,
+        }
+    )
 
 
 def balance_stories() -> list[dict]:
@@ -534,7 +556,7 @@ def bundles() -> list[dict]:
         {
             "key": "demo-balance",
             "name": "Demo balance",
-            "group": "",
+            "group": "demo",
             "channels": ["chat"],
             "summary": "Reads one balance and says whether it is under 50. EUR is fine. USD is low.",
             "graph": balance_graph(),
@@ -549,13 +571,24 @@ def bundles() -> list[dict]:
         {
             "key": "demo-alert",
             "name": "Demo alert",
-            "group": "",
+            "group": "demo",
             "channels": ["chat", "rule"],
             "summary": "A chat can save a below-50 alert. A rule tells them when it is already under, and stays quiet when it is not.",
             "graph": alert_graph(),
             "chat_contract": _contract(
-                "The customer wants to be told when an account goes under 50.",
+                "Demo only — the customer typed demo alert to save a fixed below-50 watch.",
                 ["demo alert"],
+                [
+                    {"key": "account", "order": 1, "fill_from": "the account they name", "ask": "Which account should I watch?"},
+                    {"key": "threshold", "order": 2, "fill_from": "", "ask": ""},
+                    {"key": "target", "order": 3, "fill_from": "", "ask": ""},
+                ],
+                exclusions=[
+                    "tell me when my account goes under 50",
+                    "tell me when it goes up to 65",
+                    "tell me when my account balance goes below 50",
+                    "warn me if my account drops below",
+                ],
             ),
             "stories": alert_stories(),
             "eval_config": config,
@@ -564,7 +597,7 @@ def bundles() -> list[dict]:
         {
             "key": "demo-move",
             "name": "Demo move",
-            "group": "",
+            "group": "demo",
             "channels": ["chat"],
             "summary": "Moves money when the source can cover it and the customer says yes. Otherwise it stops.",
             "graph": move_graph(),
@@ -580,7 +613,7 @@ def bundles() -> list[dict]:
         {
             "key": "demo-login",
             "name": "Demo login",
-            "group": "",
+            "group": "demo",
             "channels": ["chat"],
             "summary": "Signs this chat into the demo account. Use the passkey on file, or demo@kai.example and demo-pass. A wrong password stays out.",
             "graph": login_graph(),
@@ -595,7 +628,7 @@ def bundles() -> list[dict]:
         {
             "key": "demo-choose",
             "name": "Demo choose",
-            "group": "",
+            "group": "demo",
             "channels": ["chat"],
             "summary": "Offers three options. The one they pick is the next step.",
             "graph": choose_graph(),
@@ -610,7 +643,7 @@ def bundles() -> list[dict]:
         {
             "key": "demo-list",
             "name": "Demo list",
-            "group": "",
+            "group": "demo",
             "channels": ["chat"],
             "summary": "Asks residence and source of funds from predefined lists. Three skips stop the run.",
             "graph": list_graph(),

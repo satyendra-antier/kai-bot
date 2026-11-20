@@ -297,19 +297,36 @@ def _with_questions(steps: list[dict]) -> list[dict]:
     return steps
 
 
-def _empty_contract(summary: str) -> dict:
-    return {
-        "setup": summary,
-        "description": summary,
-        "examples": ["I want to open an account"],
-        "exclusions": [],
-        "bands": {"start_at": 0.75, "ask_at": 0.5, "not_this_below": 0.5},
-        "slots": [],
-        "lines": {},
-        "never": [],
-        "try_prompts": ["I want to open an account"],
-        "preview_ledger": {"accounts": {}},
-    }
+def _empty_contract(summary: str, examples: list[str], exclusions: list[str] | None = None) -> dict:
+    from kai.engine.slots import sync_try_prompts
+
+    return sync_try_prompts(
+        {
+            "setup": summary,
+            "description": summary,
+            "examples": list(examples),
+            "exclusions": list(exclusions or []),
+            "bands": {"start_at": 0.75, "ask_at": 0.5, "not_this_below": 0.5},
+            "slots": [],
+            "lines": {},
+            "never": [
+                {
+                    "id": "no_password",
+                    "mode": "judged",
+                    "text": "Never ask for a password or PIN",
+                    "forbidden": ["what's your password", "enter your pin", "share your password"],
+                },
+                {
+                    "id": "no_fake_pass",
+                    "mode": "judged",
+                    "text": "Never invent a KYC pass",
+                    "forbidden": ["you're already approved", "kyc already passed"],
+                },
+            ],
+            "try_prompts": [],
+            "preview_ledger": {"accounts": {}},
+        }
+    )
 
 
 def bundles() -> list[dict]:
@@ -328,7 +345,11 @@ def bundles() -> list[dict]:
             "channels": ["chat"],
             "summary": individual_summary,
             "graph": compile_paths(individual_steps, individual_stories, {"chat": "chat_request", "handoff": "chat_request"}),
-            "chat_contract": _empty_contract(individual_summary),
+            "chat_contract": _empty_contract(
+                individual_summary,
+                ["I want to open a personal account", "open an account for myself", "individual onboarding", "onboarding"],
+                ["business account", "company account", "Kai for Business", "business onboarding"],
+            ),
             "stories": individual_stories,
             "eval_config": config,
         },
@@ -339,7 +360,11 @@ def bundles() -> list[dict]:
             "channels": ["chat"],
             "summary": business_summary,
             "graph": compile_paths(business_steps, business_stories, {"chat": "chat_request", "handoff": "handoff_from_individual"}),
-            "chat_contract": _empty_contract(business_summary),
+            "chat_contract": _empty_contract(
+                business_summary,
+                ["I want to open a business account", "open a company account", "Kai for Business", "business onboarding"],
+                ["personal account", "for myself", "individual onboarding"],
+            ),
             "stories": business_stories,
             "eval_config": config,
         },

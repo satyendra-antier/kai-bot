@@ -1,4 +1,16 @@
-from kai.intelligence import CUSTOMERS, duration_label, live_rules, run_history, runs_payload, rules_payload, started_label
+from datetime import datetime, timedelta
+
+from kai.intelligence import (
+    CUSTOMERS,
+    duration_label,
+    live_rules,
+    run_ended_on,
+    run_history,
+    runs_payload,
+    rules_payload,
+    started_label,
+    turns_for_run,
+)
 
 WORKFLOWS = [
     {"id": "low-balance-top-up", "name": "Low balance top-up"},
@@ -124,8 +136,23 @@ def test_live_rules_match_the_screen():
 
 
 def test_duration_labels():
-    from datetime import datetime
-
     start = datetime(2026, 9, 22, 8, 15)
     assert duration_label(start, datetime(2026, 9, 22, 10, 29)) == "2h 14m"
     assert started_label(start) == "22 Sep 08:15"
+
+
+def test_run_ended_on_and_turns_stay_inside_the_run():
+    assert run_ended_on({"ended_on": "", "result": "not_served", "status": "completed"}) == "not served"
+    assert run_ended_on({"ended_on": "", "result": None, "status": "waiting", "step_id": "ask_residence"}) == "waiting · ask_residence"
+    start = datetime(2026, 11, 4, 9, 0, 0)
+    end = datetime(2026, 11, 4, 9, 0, 30)
+    turns = [
+        {"text": "check balance", "workflow_key": "", "action": "answer", "created_at": start - timedelta(minutes=2)},
+        {"text": "demo list", "workflow_key": "demo-list", "action": "start", "created_at": start},
+        {"text": "Other", "workflow_key": "demo-list", "action": "choice", "created_at": start + timedelta(seconds=5)},
+        {"text": "check balance", "workflow_key": "", "action": "answer", "tool": "balance", "created_at": end + timedelta(seconds=3)},
+        {"text": "austria", "workflow_key": "", "action": "chat", "created_at": end + timedelta(seconds=1)},
+    ]
+    kept = turns_for_run({"started_at": start, "finished_at": end, "workflow_id": "demo-list"}, turns)
+    assert [row["text"] for row in kept] == ["demo list", "Other"]
+    assert all(row.get("tool") != "balance" for row in kept)

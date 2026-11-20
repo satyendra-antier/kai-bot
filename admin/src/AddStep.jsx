@@ -57,7 +57,7 @@ export default function AddStep({ types, steps, anchorId, onAdd, onClose }) {
         <header>
           <div>
             <strong>{title}</strong>
-            <span>Pick a category, then a template</span>
+            <span>From the shared step-type registry (same list as Settings → Step types)</span>
           </div>
           <button type="button" className="link" onClick={onClose} aria-label="Close">×</button>
         </header>
@@ -72,10 +72,16 @@ export default function AddStep({ types, steps, anchorId, onAdd, onClose }) {
           </div>
           <div className="modal-templates">
             <p>{KIND_ABOUT[kind]}</p>
+            <p className="hint">Each card is a step type template — not a whole workflow. Adding it places one node on this canvas.</p>
             {templates.map((item) => (
               <button key={item.type} type="button" className={chosen?.type === item.type ? "on" : ""} onClick={() => setTypeName(item.type)}>
                 <strong>{item.title}</strong>
                 <span>{item.summary}</span>
+                {(item.usage_count ?? (item.used_as || []).length) ? (
+                  <small>Used on {item.usage_count ?? (item.used_as || []).length} step{(item.usage_count ?? (item.used_as || []).length) === 1 ? "" : "s"}</small>
+                ) : (
+                  <small>Not used on a canvas yet</small>
+                )}
               </button>
             ))}
           </div>
@@ -86,9 +92,9 @@ export default function AddStep({ types, steps, anchorId, onAdd, onClose }) {
               <p>{chosen.summary}</p>
               <label>Lands in</label>
               <p>{lane?.title || "Continue / true"}</p>
-              <label>Input</label>
+              <label>Input shape</label>
               <pre>{input || "— none"}</pre>
-              <label>Output</label>
+              <label>Output shape</label>
               <pre>{output || "— none"}</pre>
               <button type="button" className="add-step" onClick={() => onAdd(chosen)}>Add this step</button>
             </div>
